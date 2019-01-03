@@ -11,6 +11,7 @@ error_log logs/error.log ${{LOG_LEVEL}};
 
 events {}
 
+> if #proxy_listeners > 0 or #admin_listeners > 0 then
 http {
     charset UTF-8;
 
@@ -455,6 +456,7 @@ http {
         }
     }
 }
+> end
 
 > if #stream_listeners > 0 then
 stream {
@@ -478,13 +480,6 @@ stream {
 > end
     lua_shared_dict stream_prometheus_metrics  5m;
 
-    upstream kong_upstream {
-        server 0.0.0.1:1;
-        balancer_by_lua_block {
-            Kong.balancer()
-        }
-    }
-
     init_by_lua_block {
         -- shared dictionaries conflict between stream/http modules. use a prefix.
         local shared = ngx.shared
@@ -507,6 +502,13 @@ stream {
         Kong.init_worker()
     }
 
+    upstream kong_upstream {
+        server 0.0.0.1:1;
+        balancer_by_lua_block {
+            Kong.balancer()
+        }
+    }
+
     server {
 > for i = 1, #stream_listeners do
         listen $(stream_listeners[i].listener);
@@ -514,6 +516,10 @@ stream {
 
         access_log logs/access.log basic;
         error_log logs/error.log debug;
+
+> for i = 1, #trusted_ips do
+        set_real_ip_from   $(trusted_ips[i]);
+> end
 
 > if ssl_preread_enabled then
         ssl_preread on;
