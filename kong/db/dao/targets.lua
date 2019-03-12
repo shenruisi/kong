@@ -7,8 +7,8 @@ local cjson = require "cjson"
 local setmetatable = setmetatable
 local tostring = tostring
 local ipairs = ipairs
-local assert = assert
 local table = table
+local min = math.min
 
 
 local _TARGETS = {}
@@ -27,28 +27,31 @@ end
 
 
 local function clean_history(self, upstream_pk)
-  -- when to cleanup: invalid-entries > (valid-ones * cleanup_factor)
-  local cleanup_factor = 10
+  -- when to cleanup: when less than 10 percent of the entries are valid
+  local cleanup_factor = 0.1
 
   --cleaning up history, check if it's necessary...
-  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk)
+  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk, 1000)
   if not targets then
     return nil, err, err_t
   end
 
   -- do clean up
-  local cleaned = {}
+  local seen = {}
   local delete = {}
 
-  for _, entry in ipairs(targets) do
-    if cleaned[entry.target] then
+  -- Read the history in reverse order, to obtain the most
+  -- recent state of each target.
+  for i = #targets, 1, -1 do
+    local entry = targets[i]
+
+    if seen[entry.target] then
       -- we got a newer entry for this target than this, so this one can go
       delete[#delete+1] = entry
 
     else
-      -- haven't got this one, so this is the last one for this target
-      cleaned[entry.target] = true
-      cleaned[#cleaned+1] = entry
+      -- haven't got this one, so this is the current state for this target
+      seen[entry.target] = true
       if entry.weight == 0 then
         delete[#delete+1] = entry
       end
@@ -56,9 +59,7 @@ local function clean_history(self, upstream_pk)
   end
 
   -- do we need to cleanup?
-  -- either nothing left, or when 10x more outdated than active entries
-  if (#cleaned == 0 and #delete > 0) or
-     (#delete >= (math.max(#cleaned,1)*cleanup_factor)) then
+  if #delete > #targets * (1 - cleanup_factor) then
 
     ngx.log(ngx.NOTICE, "[Target DAO] Starting cleanup of target table for upstream ",
                tostring(upstream_pk.id))
@@ -99,9 +100,12 @@ function _TARGETS:insert(entity)
     entity.target = formatted_target
   end
 
-  clean_history(self, entity.upstream)
+  local row, err, err_t = self.super.insert(self, entity)
+  if row then
+    clean_history(self, entity.upstream)
+  end
 
-  return self.super.insert(self, entity)
+  return row, err, err_t
 end
 
 
@@ -171,7 +175,7 @@ function _TARGETS:page_for_upstream(upstream_pk, size, offset, options)
   -- extract the page requested by the user.
 
   -- Read all targets; this returns the target history sorted chronologically
-  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk, nil, options)
+  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk, 1000, options)
   if not targets then
     return nil, err, err_t
   end
@@ -201,8 +205,8 @@ function _TARGETS:page_for_upstream(upstream_pk, size, offset, options)
   end
 
   -- Extract the requested page
-  local page = setmetatable({}, cjson.empty_array_mt)
-  size = math.min(size or 100, 1000)
+  local page = setmetatable({}, cjson.array_mt)
+  size = min(size or 100, 1000)
   offset = offset or 0
   for i = 1 + offset, size + offset do
     local target = all_active_targets[i]
@@ -256,29 +260,16 @@ end
 
 
 function _TARGETS:select_by_upstream_filter(upstream_pk, filter, options)
-  assert(filter.id or filter.target)
-
-  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk, nil, options)
+  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk, 1000, options)
   if not targets then
     return nil, err, err_t
   end
-  if filter.id then
-    for _, t in ipairs(targets) do
-      if t.id == filter.id then
-        return t
-      end
-    end
-    local err_t = self.errors:not_found(filter.id)
-    return nil, tostring(err_t), err_t
-  end
 
   for _, t in ipairs(targets) do
-    if t.target == filter.target then
+    if t.id == filter.id or t.target == filter.target then
       return t
     end
   end
-  err_t = self.errors:not_found_by_field({ target = filter.target })
-  return nil, tostring(err_t), err_t
 end
 
 

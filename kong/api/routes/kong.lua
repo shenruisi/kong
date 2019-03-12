@@ -19,12 +19,12 @@ local lua_version = jit and jit.version or _VERSION
 return {
   ["/"] = {
     GET = function(self, dao, helpers)
-      local distinct_plugins = setmetatable({}, cjson.empty_array_mt)
+      local distinct_plugins = setmetatable({}, cjson.array_mt)
       local prng_seeds = {}
 
       do
         local set = {}
-        for row, err in kong.db.plugins:each() do
+        for row, err in kong.db.plugins:each(1000) do
           if err then
             kong.log.err(err)
             return kong.response.exit(500, { message = "An unexpected error happened" })
