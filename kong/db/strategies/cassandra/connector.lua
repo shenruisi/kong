@@ -14,20 +14,115 @@ function CassandraConnector.new(kong_config)
   do
     -- Resolve contact points before instantiating cluster, since the
     -- driver does not support hostnames in the contact points list.
+    --
+    -- The below logic includes a hack so that we are able to run our DNS
+    -- resolver in init_by_lua:
+    --
+    -- 1. We override ngx.socket.tcp/udp so that resty.dns.resolver will run
+    --    in init_by_lua (which has no cosockets)
+    -- 2. We force the dns_no_sync option so that resty.dns.client will not
+    --    spawn an ngx.timer (not supported in init_by_lua)
+    --
+    -- TODO: replace fallback logic with lua-resty-socket once it supports
+    --       ngx.socket.udp
+
+    local tcp_old = ngx.socket.tcp
+    local udp_old = ngx.socket.udp
+
+    local dns_no_sync_old = kong_config.dns_no_sync
+
+    package.loaded["socket"] = nil
+    package.loaded["kong.tools.dns"] = nil
+    package.loaded["resty.dns.client"] = nil
+    package.loaded["resty.dns.resolver"] = nil
+
+    ngx.socket.tcp = function(...) -- luacheck: ignore
+      local tcp = require("socket").tcp(...)
+      return setmetatable({}, {
+        __newindex = function(_, k, v)
+          tcp[k] = v
+        end,
+        __index = function(_, k)
+          if type(tcp[k]) == "function" then
+            return function(_, ...)
+              if k == "send" then
+                local value = select(1, ...)
+                if type(value) == "table" then
+                  return tcp.send(tcp, table.concat(value))
+                end
+
+                return tcp.send(tcp, ...)
+
+              elseif k == "settimeout" then
+                return tcp.settimeout(tcp, select(1, ...)/1000)
+              end
+
+              return tcp[k](tcp, ...)
+            end
+          end
+
+          return tcp[k]
+        end
+      })
+    end
+
+    ngx.socket.udp = function(...) -- luacheck: ignore
+      local udp = require("socket").udp(...)
+      return setmetatable({}, {
+        __newindex = function(_, k, v)
+          udp[k] = v
+        end,
+        __index = function(_, k)
+          if type(udp[k]) == "function" then
+            return function(_, ...)
+              if k == "send" then
+                local value = select(1, ...)
+                if type(value) == "table" then
+                  return udp.send(udp, table.concat(value))
+                end
+
+                return udp.send(udp, ...)
+
+              elseif k == "settimeout" then
+                return udp.settimeout(udp, select(1, ...)/1000)
+              end
+
+              return udp[k](udp, ...)
+            end
+          end
+
+          return udp[k]
+        end
+      })
+    end
+
     local dns_tools = require "kong.tools.dns"
+
+    kong_config.dns_no_sync = true
+
     local dns = dns_tools(kong_config)
 
     for i, cp in ipairs(kong_config.cassandra_contact_points) do
-      local ip, err = dns.toip(cp)
+      local ip, err, try_list = dns.toip(cp)
       if not ip then
-        log.error("could not resolve Cassandra contact point '%s': %s",
-                  cp, err)
+        log.error("[cassandra] DNS resolution failed for contact " ..
+                  "point '%s': %s. Tried: %s", cp, err, tostring(try_list))
 
       else
         log.debug("resolved Cassandra contact point '%s' to: %s", cp, ip)
         resolved_contact_points[i] = ip
       end
     end
+
+    kong_config.dns_no_sync = dns_no_sync_old
+
+    package.loaded["resty.dns.resolver"] = nil
+    package.loaded["resty.dns.client"] = nil
+    package.loaded["kong.tools.dns"] = nil
+    package.loaded["socket"] = nil
+
+    ngx.socket.udp = udp_old -- luacheck: ignore
+    ngx.socket.tcp = tcp_old -- luacheck: ignore
   end
 
   if #resolved_contact_points == 0 then
@@ -86,6 +181,15 @@ function CassandraConnector.new(kong_config)
     cluster_options.lb_policy = policy.new(kong_config.cassandra_local_datacenter)
   end
 
+  local serial_consistency
+
+  if string.find(kong_config.cassandra_lb_policy, "DCAware", nil, true) then
+    serial_consistency = cassandra.consistencies.local_serial
+
+  else
+    serial_consistency = cassandra.consistencies.serial
+  end
+
   local cluster, err = Cluster.new(cluster_options)
   if not cluster then
     return nil, err
@@ -99,8 +203,9 @@ function CassandraConnector.new(kong_config)
         cassandra.consistencies[kong_config.cassandra_consistency:lower()],
       read_consistency =
         cassandra.consistencies[kong_config.cassandra_consistency:lower()],
-      serial_consistency = cassandra.consistencies.serial, -- TODO: or local_serial
+      serial_consistency = serial_consistency,
     },
+    refresh_frequency = kong_config.cassandra_refresh_frequency,
     connection = nil, -- created by connect()
   }
 
@@ -157,6 +262,36 @@ function CassandraConnector:init()
 
   self.major_version = major_version
   self.major_minor_version = major_minor_version
+
+  return true
+end
+
+
+function CassandraConnector:init_worker()
+  if self.refresh_frequency > 0 then
+    local hdl, err = ngx.timer.every(self.refresh_frequency, function()
+      local ok, err, topology = self.cluster:refresh(self.refresh_frequency)
+      if not ok then
+        ngx.log(ngx.ERR, "[cassandra] failed to refresh cluster topology: ",
+                         err)
+
+      elseif topology then
+        if #topology.added > 0 then
+          ngx.log(ngx.NOTICE, "[cassandra] peers added to cluster topology: ",
+                              table.concat(topology.added, ", "))
+        end
+
+        if #topology.removed > 0 then
+          ngx.log(ngx.NOTICE, "[cassandra] peers removed from cluster topology: ",
+                              table.concat(topology.removed, ", "))
+        end
+      end
+    end)
+    if not hdl then
+      return nil, "failed to initialize Cassandra topology refresh timer: " ..
+                  err
+    end
+  end
 
   return true
 end
@@ -329,6 +464,51 @@ function CassandraConnector:query(query, args, opts, operation)
       end
     end
   end
+
+  if not conn then
+    coordinator:setkeepalive()
+  end
+
+  if err then
+    return nil, err
+  end
+
+  return res
+end
+
+function CassandraConnector:batch(query_args, opts, operation, logged)
+  if operation ~= nil and operation ~= "read" and operation ~= "write" then
+    error("operation must be 'read' or 'write', was: " .. tostring(operation), 2)
+  end
+
+  if not opts then
+    opts = {}
+  end
+
+  if operation == "write" then
+    opts.consistency = self.opts.write_consistency
+
+  else
+    opts.consistency = self.opts.read_consistency
+  end
+
+  opts.serial_consistency = self.opts.serial_consistency
+
+  opts.logged = logged
+
+  local conn = self:get_stored_connection()
+
+  local coordinator = conn
+
+  if not conn then
+    local err
+    coordinator, err = self.cluster:next_coordinator()
+    if not coordinator then
+      return nil, err
+    end
+  end
+
+  local res, err = coordinator:batch(query_args, opts)
 
   if not conn then
     coordinator:setkeepalive()
@@ -702,21 +882,23 @@ do
 
     -- create keyspace if not exists
 
-    log.debug("creating '%s' keyspace if not existing...",
-              kong_config.cassandra_keyspace)
+    local keyspace = kong_config.cassandra_keyspace
+    local ok = conn:change_keyspace(keyspace)
+    if not ok then
+      log.debug("creating '%s' keyspace if not existing...", keyspace)
 
-    local res, err = conn:execute(string.format([[
-      CREATE KEYSPACE IF NOT EXISTS %q
-      WITH REPLICATION = %s
-    ]], kong_config.cassandra_keyspace, cql_replication))
-    if not res then
-      return nil, err
+      local res, err = conn:execute(string.format([[
+        CREATE KEYSPACE IF NOT EXISTS %q
+        WITH REPLICATION = %s
+      ]], keyspace, cql_replication))
+      if not res then
+        return nil, err
+      end
+
+      log.debug("successfully created '%s' keyspace", keyspace)
     end
 
-    log.debug("successfully created '%s' keyspace",
-              kong_config.cassandra_keyspace)
-
-    local ok, err = conn:change_keyspace(kong_config.cassandra_keyspace)
+    local ok, err = conn:change_keyspace(keyspace)
     if not ok then
       return nil, err
     end
@@ -802,10 +984,13 @@ do
         local res, err = conn:execute(cql)
         if not res then
           if string.find(err, "Column .- was not found in table")
-             or string.find(err, "[Ii]nvalid column name") then
+          or string.find(err, "[Ii]nvalid column name")
+          or string.find(err, "[Uu]ndefined column name")
+          or string.find(err, "No column definition found for column")
+          or string.find(err, "Undefined name .- in selection clause")
+          then
             log.warn("ignored error while running '%s' migration: %s (%s)",
                      name, err, cql:gsub("\n", " "):gsub("%s%s+", " "))
-
           else
             return nil, err
           end
@@ -875,240 +1060,6 @@ do
     end
 
     return true
-  end
-
-
-  local function does_table_exist(self, table_name)
-    local cql
-
-    -- For now we will assume that a release version number of 3 and greater
-    -- will use the same schema. This is recognized as a hotfix and will be
-    -- revisited for a more considered solution at a later time.
-    if self.major_version >= 3 then
-      cql = [[
-        SELECT COUNT(*) FROM system_schema.tables
-         WHERE keyspace_name = ? AND table_name = ?
-      ]]
-
-    else
-      cql = [[
-        SELECT COUNT(*) FROM system.schema_columnfamilies
-         WHERE keyspace_name = ? AND columnfamily_name = ?
-      ]]
-    end
-
-    local conn = self:get_stored_connection()
-    if not conn then
-      error("no connection")
-    end
-
-    local rows, err = conn:execute(cql, {
-      self.keyspace,
-      table_name,
-    })
-    if err then
-      return nil, err
-    end
-
-    if not rows or not rows[1] or rows[1].count == 0 then
-      return false
-    end
-
-    return true
-  end
-
-
-  function CassandraConnector:are_014_apis_present()
-    local exists, err = does_table_exist(self, "apis")
-    if err then
-      return nil, err
-    end
-
-    if not exists then
-      return false
-    end
-
-    local rows, err = self:query([[
-      SELECT * FROM ]] .. self.keyspace .. [[.apis LIMIT 1;
-    ]])
-    if err then
-      return nil, err
-    end
-    return rows and #rows > 0 or false
-  end
-
-
-  function CassandraConnector:is_014()
-    local res = {}
-
-    local needed_migrations = {
-      ["core"] = {
-        "2015-01-12-175310_skeleton",
-        "2015-01-12-175310_init_schema",
-        "2015-11-23-817313_nodes",
-        "2016-02-25-160900_remove_null_consumer_id",
-        "2016-02-29-121813_remove_ttls",
-        "2016-09-05-212515_retries_step_1",
-        "2016-09-05-212515_retries_step_2",
-        "2016-09-16-141423_upstreams",
-        "2016-12-14-172100_move_ssl_certs_to_core",
-        "2016-11-11-151900_new_apis_router_1",
-        "2016-11-11-151900_new_apis_router_2",
-        "2016-11-11-151900_new_apis_router_3",
-        "2017-01-24-132600_upstream_timeouts",
-        "2017-01-24-132600_upstream_timeouts_2",
-        "2017-03-27-132300_anonymous",
-        "2017-04-04-145100_cluster_events",
-        "2017-05-19-173100_remove_nodes_table",
-        "2017-07-28-225000_balancer_orderlist_remove",
-        "2017-11-07-192000_upstream_healthchecks",
-        "2017-10-27-134100_consistent_hashing_1",
-        "2017-11-07-192100_upstream_healthchecks_2",
-        "2017-10-27-134100_consistent_hashing_2",
-        "2017-09-14-140200_routes_and_services",
-        "2017-10-25-180700_plugins_routes_and_services",
-        "2018-02-23-142400_targets_add_index",
-        "2018-03-22-141700_create_new_ssl_tables",
-        "2018-03-26-234600_copy_records_to_new_ssl_tables",
-        "2018-03-27-002500_drop_old_ssl_tables",
-        "2018-03-16-160000_index_consumers",
-        "2018-05-17-173100_hash_on_cookie",
-      },
-      ["response-transformer"] = {
-        "2016-03-10-160000_resp_trans_schema_changes",
-      },
-      ["jwt"] = {
-        "2015-06-09-jwt-auth",
-        "2016-03-07-jwt-alg",
-        "2017-07-31-120200_jwt-auth_preflight_default",
-        "2017-10-25-211200_jwt_cookie_names_default",
-        "2018-03-15-150000_jwt_maximum_expiration",
-      },
-      ["ip-restriction"] = {
-        "2016-05-24-remove-cache",
-      },
-      ["statsd"] = {
-        "2017-06-09-160000_statsd_schema_changes",
-      },
-      ["cors"] = {
-        "2017-03-14_multiple_orgins",
-      },
-      ["basic-auth"] = {
-        "2015-08-03-132400_init_basicauth",
-      },
-      ["key-auth"] = {
-        "2015-07-31-172400_init_keyauth",
-        "2017-07-31-120200_key-auth_preflight_default",
-      },
-      ["ldap-auth"] = {
-        "2017-10-23-150900_header_type_default",
-      },
-      ["hmac-auth"] = {
-        "2015-09-16-132400_init_hmacauth",
-        "2017-06-21-132400_init_hmacauth",
-      },
-      ["datadog"] = {
-        "2017-06-09-160000_datadog_schema_changes",
-      },
-      ["tcp-log"] = {
-        "2017-12-13-120000_tcp-log_tls",
-      },
-      ["acl"] = {
-        "2015-08-25-841841_init_acl",
-      },
-      ["response-ratelimiting"] = {
-        "2015-08-21_init_response-rate-limiting",
-        "2016-08-04-321512_response-rate-limiting_policies",
-        "2017-12-19-120000_add_route_and_service_id_to_response_ratelimiting",
-      },
-      ["request-transformer"] = {
-        "2016-03-10-160000_req_trans_schema_changes",
-      },
-      ["rate-limiting"] = {
-        "2015-08-03-132400_init_ratelimiting",
-        "2016-07-25-471385_ratelimiting_policies",
-        "2017-11-30-120000_add_route_and_service_id",
-      },
-      ["oauth2"] = {
-        "2016-09-19-oauth2_api_id",
-        "2016-12-15-set_global_credentials",
-        "2017-10-19-set_auth_header_name_default",
-        "2017-10-11-oauth2_new_refresh_token_ttl_config_value",
-        "2018-01-09-oauth2_c_add_service_id",
-      },
-    }
-
-    local exists, err = does_table_exist(self, "schema_migrations")
-    if err then
-      return nil, err
-    end
-
-    if not exists then
-      -- no trace of legacy migrations: above 0.14
-      return res
-    end
-
-    local conn = self:get_stored_connection()
-    if not conn then
-      error("no connection")
-    end
-
-    local ok, err = conn:change_keyspace(self.keyspace)
-    if not ok then
-      return nil, err
-    end
-
-    local schema_migrations_rows, err = conn:execute([[
-      SELECT id, migrations FROM schema_migrations
-    ]])
-    if err then
-      return nil, err
-    end
-
-    if not schema_migrations_rows then
-      -- empty legacy migrations: invalid state
-      res.invalid_state = true
-      return res
-    end
-
-    local schema_migrations = {}
-    for i = 1, #schema_migrations_rows do
-      local row = schema_migrations_rows[i]
-      schema_migrations[row.id] = row.migrations
-    end
-
-    for name, migrations in pairs(needed_migrations) do
-      local current_migrations = schema_migrations[name]
-      if not current_migrations then
-        -- missing all migrations for a component: below 0.14
-        res.invalid_state = true
-        res.missing_component = name
-        return res
-      end
-
-      for _, needed_migration in ipairs(migrations) do
-        local found = false
-        for _, current_migration in ipairs(current_migrations) do
-          if current_migration == needed_migration then
-            found = true
-            break
-          end
-        end
-
-        if not found then
-          -- missing at least one migration for a component: below 0.14
-          res.invalid_state = true
-          res.missing_component = name
-          res.missing_migration = needed_migration
-          return res
-        end
-      end
-    end
-
-    -- all migrations match: 0.14 install
-    res.is_014 = true
-
-    return res
   end
 end
 

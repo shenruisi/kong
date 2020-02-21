@@ -18,6 +18,7 @@ local pairs         = pairs
 local error         = error
 local upper         = string.upper
 local null          = ngx.null
+local type          = type
 local load          = load
 local find          = string.find
 local now           = ngx.now
@@ -462,7 +463,17 @@ local function toerror(strategy, err, primary_key, entity)
 
       local foreign_key = {}
       for _, key in ipairs(foreign_schema.primary_key) do
-        foreign_key[key] = entity[foreign_field_name][key]
+        if entity[foreign_field_name] then
+          foreign_key[key] = entity[foreign_field_name][key]
+
+        else
+          if primary_key[key] then
+            foreign_key[key] = primary_key[key]
+
+          elseif primary_key[foreign_field_name] then
+            foreign_key[key] = primary_key[foreign_field_name][key]
+          end
+        end
       end
 
       return nil, errors:foreign_key_violation_invalid_reference(foreign_key,
@@ -543,6 +554,9 @@ local function execute(strategy, statement_name, attributes, options)
     else
       if i == argc and is_update and attributes[UNIQUE] then
         value = attributes[UNIQUE]
+        if type(value) == "table" then
+          value = value[name]
+        end
 
       else
         value = attributes[name]
@@ -562,6 +576,10 @@ end
 
 
 local function page(self, size, token, foreign_key, foreign_entity_name, options)
+  if not size then
+    size = self.connector:get_page_size(options)
+  end
+
   local limit = size + 1
 
   local statement_name
@@ -575,6 +593,14 @@ local function page(self, size, token, foreign_key, foreign_entity_name, options
         [LIMIT]               = limit,
       }
 
+    elseif options and options.tags then
+      statement_name = options.tags_cond == "or" and
+                      "page_by_tags_or_next" or
+                      "page_by_tags_and_next"
+      attributes     = {
+        tags    = options.tags,
+        [LIMIT] = limit,
+      }
     else
       statement_name = "page_next"
       attributes     = {
@@ -603,7 +629,14 @@ local function page(self, size, token, foreign_key, foreign_entity_name, options
         [foreign_entity_name] = foreign_key,
         [LIMIT]               = limit,
       }
-
+    elseif options and options.tags then
+      statement_name = options.tags_cond == "or" and
+                      "page_by_tags_or_first" or
+                      "page_by_tags_and_first"
+      attributes     = {
+        tags    = options.tags,
+        [LIMIT] = limit,
+      }
     else
       statement_name = "page_first"
       attributes     = {
@@ -754,7 +787,14 @@ end
 
 
 function _mt:update_by_field(field_name, unique_value, entity, options)
-  local res, err = execute(self, "update_by_" .. field_name, self.collapse({ [UNIQUE] = unique_value }, entity), {
+  local filter
+  if type(unique_value) == "table" then
+    filter = self.collapse({ [field_name] = unique_value })
+  else
+    filter = unique_value
+  end
+
+  local res, err = execute(self, "update_by_" .. field_name, self.collapse({ [UNIQUE] = filter }, entity), {
     update = true,
     ttl    = options and options.ttl,
   })
@@ -881,8 +921,9 @@ function _M.new(connector, schema, errors)
   end
 
   local ttl                           = schema.ttl == true
+  local tags                          = schema.fields.tags ~= nil
   local composite_cache_key           = schema.cache_key and #schema.cache_key > 1
-  local max_name_length               = ttl and 3  or 1
+  local max_name_length               = schema.cache_key and 11 or (ttl and 3  or 1)
   local max_type_length               = ttl and 24 or 1
   local fields                        = {}
   local fields_count                  = 0
@@ -894,6 +935,7 @@ function _M.new(connector, schema, errors)
   local foreign_key_constraints       = {}
   local foreign_key_constrainst_count = 0
   local foreign_key_indexes_escaped   = {}
+  local foreign_key_indexes_count     = 0
   local foreign_key_indexes           = {}
   local foreign_key_count             = 0
   local foreign_key_list              = {}
@@ -901,6 +943,7 @@ function _M.new(connector, schema, errors)
 
   local unique_fields_count           = 0
   local unique_fields                 = {}
+
 
   for field_name, field in schema:each_field() do
     if field.type == "foreign" then
@@ -910,6 +953,7 @@ function _M.new(connector, schema, errors)
       local foreign_col_names        = {}
       local foreign_pk_count         = #foreign_schema.primary_key
       local is_part_of_composite_key = foreign_pk_count > 1
+      local is_unique_foreign        = field.unique == true
 
       local on_delete = field.on_delete
       if on_delete then
@@ -949,7 +993,7 @@ function _M.new(connector, schema, errors)
         local name_escaped           = escape_identifier(connector, name)
         local name_expression        = escape_identifier(connector, name, foreign_field)
         local type_postgres          = field_type_to_postgres_type(foreign_field)
-        local is_used_in_primary_key = primary_key_fields[name] ~= nil
+        local is_used_in_primary_key = primary_key_fields[field_name] ~= nil
         local is_unique              = foreign_field.unique == true
         local is_endpoint_key        = schema.endpoint_key == field_name
 
@@ -964,11 +1008,13 @@ function _M.new(connector, schema, errors)
           name                       = name,
           name_escaped               = name_escaped,
           name_expression            = name_expression,
+          field_name                 = field_name,
           type_postgres              = type_postgres,
           is_used_in_primary_key     = is_used_in_primary_key,
           is_part_of_composite_key   = is_part_of_composite_key,
           is_unique                  = is_unique,
           is_endpoint_key            = is_endpoint_key,
+          is_unique_foreign          = is_unique_foreign,
         }
 
         if prepared_field.is_used_in_primary_key then
@@ -994,44 +1040,54 @@ function _M.new(connector, schema, errors)
         count   = foreign_pk_count,
       }
 
-      local foreign_key_index_name       = concat({ table_name, field_name }, "_fkey_")
-      local foreign_key_index_identifier = escape_identifier(connector, foreign_key_index_name)
-
       foreign_key_count = foreign_key_count + 1
-      foreign_key_indexes_escaped[foreign_key_count] = foreign_key_index_identifier
 
-      foreign_key_indexes[foreign_key_count] = concat {
-        "CREATE INDEX IF NOT EXISTS ", foreign_key_index_identifier, " ON ", table_name_escaped, " (", concat(foreign_key_escaped, ", "), ");",
-      }
+      if not is_unique_foreign then
+        local foreign_key_index_name       = concat({ table_name, field_name }, "_fkey_")
+        local foreign_key_index_identifier = escape_identifier(connector, foreign_key_index_name)
+
+        foreign_key_indexes_count = foreign_key_indexes_count + 1
+        foreign_key_indexes_escaped[foreign_key_indexes_count] = foreign_key_index_identifier
+        foreign_key_indexes[foreign_key_indexes_count] = concat {
+          "CREATE INDEX IF NOT EXISTS ", foreign_key_index_identifier, " ON ", table_name_escaped, " (", concat(foreign_key_escaped, ", "), ");",
+        }
+      end
 
       if is_part_of_composite_key then
         foreign_key_constrainst_count = foreign_key_constrainst_count + 1
         if on_delete and on_update then
           foreign_key_constraints[foreign_key_constrainst_count] = concat {
-            "  FOREIGN KEY (", concat(foreign_key_names, ", "), ")\n",
-            "   REFERENCES ", escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")\n",
-            "    ON DELETE ", on_delete, "\n",
-            "    ON UPDATE ", on_update,
+            "FOREIGN KEY (", concat(foreign_key_escaped, ", "), ")\n",
+            "   REFERENCES ",  escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")\n",
+            "    ON DELETE ",  on_delete, "\n",
+            "    ON UPDATE ",  on_update,
           }
 
         elseif on_delete then
           foreign_key_constraints[foreign_key_constrainst_count] = concat {
-            "  FOREIGN KEY (", concat(foreign_key_names, ", "), ")\n",
-            "   REFERENCES ", escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")\n",
-            "    ON DELETE ", on_delete,
+            "FOREIGN KEY (", concat(foreign_key_escaped, ", "), ")\n",
+            "   REFERENCES ",  escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")\n",
+            "    ON DELETE ",  on_delete,
           }
 
         elseif on_update then
           foreign_key_constraints[foreign_key_constrainst_count] = concat {
-            "  FOREIGN KEY (", concat(foreign_key_names, ", "), ")\n",
-            "   REFERENCES ", escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")\n",
-            "    ON UPDATE ", on_update,
+            "FOREIGN KEY (", concat(foreign_key_escaped, ", "), ")\n",
+            "   REFERENCES ",  escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")\n",
+            "    ON UPDATE ",  on_update,
           }
 
         else
           foreign_key_constraints[foreign_key_constrainst_count] = concat {
-            "  FOREIGN KEY (", concat(foreign_key_names, ", "), ")\n",
-            "   REFERENCES ", escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")",
+            "FOREIGN KEY (", concat(foreign_key_escaped, ", "), ")\n",
+            "   REFERENCES ",  escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")",
+          }
+        end
+
+        if is_unique_foreign then
+          foreign_key_constraints[foreign_key_constrainst_count] = concat {
+            foreign_key_constraints[foreign_key_constrainst_count], ",\n",
+            "       UNIQUE (", concat(foreign_key_escaped, ", "), ")"
           }
         end
       end
@@ -1093,6 +1149,7 @@ function _M.new(connector, schema, errors)
     local is_used_in_primary_key   = fields[i].is_used_in_primary_key
     local is_part_of_composite_key = fields[i].is_part_of_composite_key
     local is_unique                = fields[i].is_unique
+    local is_unique_foreign        = fields[i].is_unique_foreign
     local is_endpoint_key          = fields[i].is_endpoint_key
     local referenced_table         = fields[i].referenced_table
     local referenced_column        = fields[i].referenced_column
@@ -1123,7 +1180,11 @@ function _M.new(connector, schema, errors)
       create_expression[5] = "PRIMARY KEY"
 
       if referenced_table then
-        create_expression[6]  = "  REFERENCES "
+        if is_unique then
+          create_expression[6]  = "  UNIQUE  REFERENCES "
+        else
+          create_expression[6]  = "  REFERENCES "
+        end
         create_expression[7]  = escape_identifier(connector, referenced_table)
         create_expression[8]  = " ("
         create_expression[9]  = escape_identifier(connector, referenced_column)
@@ -1147,7 +1208,11 @@ function _M.new(connector, schema, errors)
 
     elseif referenced_table and not is_part_of_composite_key then
       create_expression[4] = rep(" ", max_type_length - #type_postgres + (#type_postgres < max_name_length and 3 or 2))
-      create_expression[5] = "REFERENCES "
+      if is_unique then
+        create_expression[5] = "UNIQUE  REFERENCES "
+      else
+        create_expression[5] = "REFERENCES "
+      end
       create_expression[6] = escape_identifier(connector, referenced_table)
       create_expression[7] = " ("
       create_expression[8] = escape_identifier(connector, referenced_column)
@@ -1166,6 +1231,11 @@ function _M.new(connector, schema, errors)
       elseif on_update then
         create_expression[10] = " ON UPDATE "
         create_expression[11] = on_update
+      end
+
+      if is_unique_foreign then
+        unique_fields_count = unique_fields_count + 1
+        unique_fields[unique_fields_count] = fields[i]
       end
 
     elseif is_unique then
@@ -1305,6 +1375,13 @@ function _M.new(connector, schema, errors)
 
     upsert_expressions = concat(upsert_expressions, ", ")
 
+    select_expressions = concat {
+      select_expressions, ",",
+      "FLOOR(EXTRACT(EPOCH FROM (",
+        ttl_escaped, " AT TIME ZONE 'UTC' - CURRENT_TIMESTAMP AT TIME ZONE 'UTC'",
+      "))) AS ", ttl_escaped
+    }
+
     create_statement = concat {
       "CREATE TABLE IF NOT EXISTS ", table_name_escaped, " (\n",
       "  ",   concat(create_expressions, ",\n  "), "\n",
@@ -1326,12 +1403,13 @@ function _M.new(connector, schema, errors)
       "  RETURNING ",  select_expressions, ";",
     }
 
+
     update_statement = concat {
       "   UPDATE ",  table_name_escaped, "\n",
       "      SET ",  update_expressions, "\n",
       "    WHERE (", pk_escaped, ") = (", update_placeholders, ")\n",
       "      AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
-      "RETURNING ",  select_expressions , ";"
+      "RETURNING ",  select_expressions, ";",
     }
 
     select_statement = concat {
@@ -1361,19 +1439,19 @@ function _M.new(connector, schema, errors)
 
     delete_statement = concat {
       "DELETE\n",
-      "  FROM ", table_name_escaped, "\n",
+      "  FROM ",  table_name_escaped, "\n",
       " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ")\n",
       "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC');",
     }
 
     count_statement = concat {
       "SELECT COUNT(*) AS ", escape_identifier(connector, "count"), "\n",
-      "  FROM ", table_name_escaped, "\n",
+      "  FROM ",  table_name_escaped, "\n",
       " WHERE (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
       " LIMIT 1;"
     }
 
-    if foreign_key_count > 0 then
+    if foreign_key_indexes_count > 0 then
       drop_statement = concat {
         "DROP INDEX IF EXISTS ", ttl_index, ", ", concat(foreign_key_indexes_escaped, ", "), ";\n",
         "DROP TABLE IF EXISTS ", table_name_escaped, ";"
@@ -1405,7 +1483,7 @@ function _M.new(connector, schema, errors)
     insert_statement = concat {
       "INSERT INTO ",  table_name_escaped, " (", insert_columns, ")\n",
       "     VALUES (", insert_expressions, ")\n",
-      "  RETURNING ",  select_expressions, ";",
+      "  RETURNING ", select_expressions, ";",
     }
 
     upsert_statement = concat {
@@ -1413,14 +1491,14 @@ function _M.new(connector, schema, errors)
       "     VALUES (", insert_expressions, ")\n",
       "ON CONFLICT (", pk_escaped, ") DO UPDATE\n",
       "        SET ",  upsert_expressions, "\n",
-      "  RETURNING ",  select_expressions, ";",
+      "  RETURNING ", select_expressions, ";",
     }
 
     update_statement = concat {
       "   UPDATE ",  table_name_escaped, "\n",
       "      SET ",  update_expressions, "\n",
       "    WHERE (", pk_escaped, ") = (", update_placeholders, ")\n",
-      "RETURNING ",  select_expressions , ";"
+      "RETURNING ", select_expressions, ";",
     }
 
     select_statement = concat {
@@ -1447,7 +1525,7 @@ function _M.new(connector, schema, errors)
 
     delete_statement = concat {
       "DELETE\n",
-      "  FROM ", table_name_escaped, "\n",
+      "  FROM ",  table_name_escaped, "\n",
       " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ");",
     }
 
@@ -1457,7 +1535,7 @@ function _M.new(connector, schema, errors)
       " LIMIT 1;"
     }
 
-    if foreign_key_count > 0 then
+    if foreign_key_indexes_count > 0 then
       drop_statement = concat {
         "DROP INDEX IF EXISTS ", concat(foreign_key_indexes_escaped, ", "), ";\n",
         "DROP TABLE IF EXISTS ", table_name_escaped, " CASCADE;"
@@ -1471,7 +1549,7 @@ function _M.new(connector, schema, errors)
   end
 
   if composite_cache_key then
-    create_statement = concat { create_statement,
+    create_statement = concat { create_statement, "\n",
       "CREATE INDEX IF NOT EXISTS ", cache_key_index,
       " ON ", table_name_escaped, " (", cache_key_escaped, ");"
     }
@@ -1488,66 +1566,65 @@ function _M.new(connector, schema, errors)
   local page_next_args   = new_tab(page_next_count, 0)
 
   local self = setmetatable({
-    connector          = connector,
-    schema             = schema,
-    errors             = errors,
-    expand             = foreign_key_count > 0 and
-                         expand(table_name .. "_expand", foreign_key_list) or
-                         noop,
-    collapse           = collapse(table_name .. "_collapse", foreign_key_list),
-    fields             = fields_hash,
-    statements         = {
-      create           = create_statement,
-      truncate         = truncate_statement,
-      count            = count_statement,
-      drop             = drop_statement,
-      insert           = {
-        expr           = insert_expressions,
-        cols           = insert_columns,
-        argn           = insert_names,
-        argc           = insert_count,
-        argv           = insert_args,
-        make           = compile(table_name .. "_insert", insert_statement),
+    connector    = connector,
+    schema       = schema,
+    errors       = errors,
+    expand       = foreign_key_count > 0 and
+                   expand(table_name .. "_expand", foreign_key_list) or
+                   noop,
+    collapse     = collapse(table_name .. "_collapse", foreign_key_list),
+    fields       = fields_hash,
+    statements   = {
+      create     = create_statement,
+      truncate   = truncate_statement,
+      count      = count_statement,
+      drop       = drop_statement,
+      insert     = {
+        expr     = insert_expressions,
+        cols     = insert_columns,
+        argn     = insert_names,
+        argc     = insert_count,
+        argv     = insert_args,
+        make     = compile(table_name .. "_insert", insert_statement),
       },
-      upsert           = {
-        expr           = upsert_expressions,
-        argn           = insert_names,
-        argc           = insert_count,
-        argv           = insert_args,
-        make           = compile(table_name .. "_upsert", upsert_statement),
+      upsert     = {
+        expr     = upsert_expressions,
+        argn     = insert_names,
+        argc     = insert_count,
+        argv     = insert_args,
+        make     = compile(table_name .. "_upsert", upsert_statement),
       },
-      update           = {
-        expr           = update_expressions,
-        placeholders   = update_placeholders,
-        argn           = update_args_names,
-        argc           = update_args_count,
-        argv           = update_args,
-        make           = compile(table_name .. "_update", update_statement),
+      update     = {
+        expr     = update_expressions,
+        argn     = update_args_names,
+        argc     = update_args_count,
+        argv     = update_args,
+        make     = compile(table_name .. "_update", update_statement),
       },
-      delete           = {
-        argn           = primary_key_names,
-        argc           = primary_key_count,
-        argv           = primary_key_args,
-        make           = compile(table_name .. "_delete", delete_statement),
+      delete     = {
+        argn     = primary_key_names,
+        argc     = primary_key_count,
+        argv     = primary_key_args,
+        make     = compile(table_name .. "_delete", delete_statement),
       },
-      select           = {
-        expr           = select_expressions,
-        argn           = primary_key_names,
-        argc           = primary_key_count,
-        argv           = primary_key_args,
-        make           = compile(table_name .. "_select" , select_statement),
+      select     = {
+        expr     = select_expressions,
+        argn     = primary_key_names,
+        argc     = primary_key_count,
+        argv     = primary_key_args,
+        make     = compile(table_name .. "_select" , select_statement),
       },
-      page_first       = {
-        argn           = { LIMIT },
-        argc           = 1,
-        argv           = single_args,
-        make           = compile(table_name .. "_first" , page_first_statement),
+      page_first = {
+        argn     = { LIMIT },
+        argc     = 1,
+        argv     = single_args,
+        make     = compile(table_name .. "_first" , page_first_statement),
       },
-      page_next        = {
-        argn           = page_next_names,
-        argc           = page_next_count,
-        argv           = page_next_args,
-        make           = compile(table_name .. "_next" , page_next_statement),
+      page_next  = {
+        argn     = page_next_names,
+        argc     = page_next_count,
+        argv     = page_next_args,
+        make     = compile(table_name .. "_next" , page_next_statement),
       },
     },
   }, _mt)
@@ -1649,6 +1726,91 @@ function _M.new(connector, schema, errors)
     end
   end
 
+  if tags then
+    local statements = self.statements
+    local pk_placeholders = {}
+
+    local argc_first = 2
+    local argv_first = new_tab(argc_first, 0)
+    local argn_first = new_tab(argc_first, 0)
+    local argc_next  = argc_first + primary_key_count
+    local argv_next  = new_tab(argc_next, 0)
+    local argn_next  = new_tab(argc_next, 0)
+
+    for i = 1, primary_key_count do
+      local index = i + 1
+      argn_next[index]   = primary_key_names[i]
+      pk_placeholders[i] = "$" .. index
+    end
+
+    pk_placeholders = concat(pk_placeholders, ", ")
+
+    argn_first[1] = "tags"
+    argn_first[argc_first] = LIMIT
+    argn_next[1] = "tags"
+    argn_next[argc_next] = LIMIT
+
+    local page_first_by_tags_statement
+    local page_next_by_tags_statement
+
+    for cond, op in pairs({["_and"] = "@>", ["_or"] = "&&"}) do
+
+      if ttl then
+        page_first_by_tags_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE tags ", op, " $1\n",
+          "     AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $2;";
+        }
+
+        page_next_by_tags_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE tags ", op, " $1\n",
+          "     AND (", pk_escaped, ") > (", pk_placeholders, ")\n",
+          "     AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $", argc_next, ";"
+        }
+      else
+        page_first_by_tags_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE tags ", op, " $1\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $2;";
+        }
+
+        page_next_by_tags_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE tags ", op, " $1\n",
+          "     AND (", pk_escaped, ") > (", pk_placeholders, ")\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $", argc_next, ";"
+        }
+      end
+
+      local statement_name = "page_by_tags"
+
+      statements[statement_name .. cond .. "_first"] = {
+        argn = argn_first,
+        argc = argc_first,
+        argv = argv_first,
+        make = compile(concat({ table_name, statement_name, "first" }, "_"), page_first_by_tags_statement),
+      }
+
+      statements[statement_name .. cond .. "_next"] = {
+        argn = argn_next,
+        argc = argc_next,
+        argv = argv_next,
+        make = compile(concat({ table_name, statement_name, "next" }, "_"), page_next_by_tags_statement)
+      }
+    end
+  end
+
   if composite_cache_key then
     unique_fields_count = unique_fields_count + 1
     insert(unique_fields, {
@@ -1664,18 +1826,19 @@ function _M.new(connector, schema, errors)
 
     for i = 1, unique_fields_count do
       local unique_field   = unique_fields[i]
+      local field_name     = unique_field.field_name or unique_field.name
       local unique_name    = unique_field.name
       local unique_escaped = unique_field.name_escaped
       local single_names   = { unique_name }
 
-      local select_by_statement_name = "select_by_" .. unique_name
+      local select_by_statement_name = "select_by_" .. field_name
       local select_by_statement
 
       if ttl then
         select_by_statement = concat {
-          "SELECT ", select_expressions, "\n",
-          "  FROM ", table_name_escaped, "\n",
-          " WHERE ", unique_escaped, " = $1\n",
+          "SELECT ",  select_expressions, "\n",
+          "  FROM ",  table_name_escaped, "\n",
+          " WHERE ",  unique_escaped, " = $1\n",
           "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
           " LIMIT 1;"
         }
@@ -1696,7 +1859,7 @@ function _M.new(connector, schema, errors)
         make = compile(concat({ table_name, select_by_statement_name }, "_"), select_by_statement),
       }
 
-      local update_by_statement_name = "update_by_" .. unique_name
+      local update_by_statement_name = "update_by_" .. field_name
       local update_by_statement
 
       if ttl then
@@ -1705,15 +1868,14 @@ function _M.new(connector, schema, errors)
           "      SET ",  update_expressions, "\n",
           "    WHERE ",  unique_escaped, " = $", update_by_args_count, "\n",
           "      AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
-          "RETURNING ",  select_expressions , ";"
+          "RETURNING ", select_expressions, ";",
         }
-
       else
         update_by_statement = concat {
           "   UPDATE ", table_name_escaped, "\n",
           "      SET ", update_expressions, "\n",
           "    WHERE ", unique_escaped, " = $", update_by_args_count, "\n",
-          "RETURNING ", select_expressions , ";"
+          "RETURNING ", select_expressions, ";",
         }
       end
 
@@ -1730,7 +1892,7 @@ function _M.new(connector, schema, errors)
         make = compile(concat({ table_name, update_by_statement_name }, "_"), update_by_statement),
       }
 
-      local upsert_by_statement_name = "upsert_by_" .. unique_name
+      local upsert_by_statement_name = "upsert_by_" .. field_name
       local conflict_key = unique_escaped
       if composite_cache_key then
         conflict_key = escape_identifier(connector, "cache_key")
@@ -1743,6 +1905,7 @@ function _M.new(connector, schema, errors)
         "  RETURNING ",  select_expressions, ";",
       }
 
+
       statements[upsert_by_statement_name] = {
         argn = insert_names,
         argc = insert_count,
@@ -1750,14 +1913,14 @@ function _M.new(connector, schema, errors)
         make = compile(concat({ table_name, upsert_by_statement_name }, "_"), upsert_by_statement),
       }
 
-      local delete_by_statement_name = "delete_by_" .. unique_name
+      local delete_by_statement_name = "delete_by_" .. field_name
       local delete_by_statement
 
       if ttl then
         delete_by_statement = concat {
           "DELETE\n",
-          "  FROM ", table_name_escaped, "\n",
-          " WHERE ", unique_escaped, " = $1\n",
+          "  FROM ",  table_name_escaped, "\n",
+          " WHERE ",  unique_escaped, " = $1\n",
           "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC');",
         }
 

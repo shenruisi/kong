@@ -65,6 +65,11 @@ for _, strategy in helpers.each_strategy() do
           assert.is_nil(err_t)
           assert.is_nil(err)
 
+          db.routes:insert({
+            service = { id = service.id },
+            hosts = { "route_" .. tostring(i) .. ".test" }
+          })
+
           services[i] = service
 
           plugins[i] = assert(db.plugins:insert({
@@ -196,7 +201,17 @@ for _, strategy in helpers.each_strategy() do
             local in_db = assert(db.plugins:select({ id = plugins[2].id }, { nulls = true }))
             assert.same(json, in_db)
           end)
-
+          it("does not infer json input", function()
+            local res = assert(client:send {
+              method = "PATCH",
+              path = "/plugins/" .. plugins[2].id,
+              body = {
+                tags = cjson.null,
+              },
+              headers = { ["Content-Type"] = "application/json" }
+            })
+            assert.res_status(200, res)
+          end)
           describe("errors", function()
             it("handles invalid input", function()
               local before = assert(db.plugins:select({ id = plugins[1].id }, { nulls = true }))

@@ -1,7 +1,15 @@
+local type = type
 local fmt = string.format
 
 
-local Connector = {}
+local Connector = {
+  defaults = {
+    pagination = {
+      page_size     = 1000,
+      max_page_size = 50000,
+    },
+  },
+}
 
 
 function Connector:init()
@@ -13,6 +21,15 @@ end
 function Connector:init_worker()
   -- nop by default
   return true
+end
+
+
+function Connector:get_page_size(options)
+  if type(options) == "table" and type(options.pagination) == "table" then
+    return options.pagination.page_size
+  end
+
+  return self.defaults.pagination.page_size
 end
 
 
@@ -142,17 +159,6 @@ end
 function Connector:record_migration()
   error(fmt("record_migration() not implemented for '%s' strategy",
             self.database))
-end
-
-
-function Connector:is_014()
-  -- Implemented pre 1.0 release with Postgres/Cassandra connectors.
-  -- All future connectors (if any) won't have to provide a mean to
-  -- migrate from 0.14, hence do not have to implement this function.
-  return {
-    is_eq_014 = false,
-    is_gt_014 = true,
-  }
 end
 
 

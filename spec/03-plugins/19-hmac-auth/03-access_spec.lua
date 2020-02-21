@@ -1,5 +1,5 @@
 local cjson = require "cjson"
-local openssl_hmac = require "openssl.hmac"
+local openssl_hmac = require "resty.openssl.hmac"
 local helpers = require "spec.helpers"
 local utils = require "kong.tools.utils"
 local resty_sha256 = require "resty.sha256"
@@ -125,6 +125,19 @@ for _, strategy in helpers.each_strategy() do
         }
       }
 
+      local route7 = bp.routes:insert {
+        hosts = { "hmacauth7.com" },
+      }
+
+      bp.plugins:insert {
+        name     = "hmac-auth",
+        route = { id = route7.id },
+        config   = {
+          anonymous  = anonymous_user.username,
+          clock_skew = 3000
+        }
+      }
+
       assert(helpers.start_kong {
         database          = strategy,
         real_ip_header    = "X-Forwarded-For",
@@ -171,7 +184,7 @@ for _, strategy in helpers.each_strategy() do
             authorization = "asd"
           }
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -188,7 +201,7 @@ for _, strategy in helpers.each_strategy() do
             authorization = hmacAuth
           }
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal("HMAC signature does not match", body.message)
       end)
@@ -202,7 +215,7 @@ for _, strategy in helpers.each_strategy() do
             authorization = "asd"
           }
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal([[HMAC signature cannot be verified, ]]
                     .. [[a valid date or x-date header is]]
@@ -220,7 +233,7 @@ for _, strategy in helpers.each_strategy() do
             ["proxy-authorization"] = "asd"
           }
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -236,7 +249,7 @@ for _, strategy in helpers.each_strategy() do
             ["proxy-authorization"] = "hmac :dXNlcm5hbWU6cGFzc3dvcmQ="
           }
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -253,7 +266,7 @@ for _, strategy in helpers.each_strategy() do
               .. [[headers,dXNlcm5hbWU6cGFzc3dvcmQ=]]
           }
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -270,7 +283,7 @@ for _, strategy in helpers.each_strategy() do
               .. [[headers,dXNlcm5hbWU6cGFzc3dvcmQ=]]
           }
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -286,7 +299,7 @@ for _, strategy in helpers.each_strategy() do
             authorization = "hmac username"
           }
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -449,6 +462,31 @@ for _, strategy in helpers.each_strategy() do
         assert.res_status(200, res)
       end)
 
+      it("should encode http-1 requests as http/1.0", function()
+        local date = os.date("!%a, %d %b %Y %H:%M:%S GMT")
+        local encodedSignature = ngx.encode_base64(
+          hmac_sha1_binary("secret", "date: "
+            .. date .. "\n" .. "content-md5: md5" .. "\nGET /request HTTP/1.0"))
+        local hmacAuth = [[hmac username="bob",  algorithm="hmac-sha1", ]]
+          .. [[headers="date content-md5 request-line", signature="]]
+          .. encodedSignature .. [["]]
+        local res = assert(proxy_client:send {
+          version = 1.0,
+          method  = "GET",
+          path    = "/request",
+          body    = {},
+          headers = {
+            ["HOST"]                = "hmacauth.com",
+            date                    = date,
+            ["proxy-authorization"] = hmacAuth,
+            authorization           = "hello",
+            ["content-md5"]         = "md5",
+          },
+        })
+        assert.res_status(200, res)
+      end)
+
+
       it("should not pass with GET with wrong username in signature", function()
         local date = os.date("!%a, %d %b %Y %H:%M:%S GMT")
         local encodedSignature = ngx.encode_base64(
@@ -470,7 +508,7 @@ for _, strategy in helpers.each_strategy() do
               },
             })
 
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -496,7 +534,7 @@ for _, strategy in helpers.each_strategy() do
           },
         })
 
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -523,7 +561,7 @@ for _, strategy in helpers.each_strategy() do
           },
         })
 
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -548,7 +586,7 @@ for _, strategy in helpers.each_strategy() do
             ["content-md5"]         = "md5",
           },
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -573,7 +611,7 @@ for _, strategy in helpers.each_strategy() do
             ["content-md5"]         = "md5",
           },
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -598,7 +636,7 @@ for _, strategy in helpers.each_strategy() do
             ["content-md5"]         = "md5",
           },
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -623,7 +661,7 @@ for _, strategy in helpers.each_strategy() do
             ["content-md5"]         = "md5",
           },
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal(SIGNATURE_NOT_VALID, body.message)
       end)
@@ -671,7 +709,7 @@ for _, strategy in helpers.each_strategy() do
             ["content-md5"]         = "md5",
           },
         })
-        assert.res_status(403, res)
+        assert.res_status(401, res)
       end)
 
       it("should pass the right headers to the upstream server", function()
@@ -742,7 +780,7 @@ for _, strategy in helpers.each_strategy() do
             ["content-md5"]         = "md5",
           },
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal([[HMAC signature cannot be verified, a valid date or]]
           .. [[ x-date header is required for HMAC Authentication]], body.message)
@@ -767,7 +805,7 @@ for _, strategy in helpers.each_strategy() do
             ["content-md5"] = "md5",
           },
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal([[HMAC signature cannot be verified, a valid date or]]
           .. [[ x-date header is required for HMAC Authentication]], body.message)
@@ -887,7 +925,7 @@ for _, strategy in helpers.each_strategy() do
         assert.is_nil(body.headers["x-anonymous-consumer"])
       end)
 
-      it("should return 403 when body validation enabled and no digest header is present", function()
+      it("should return 401 when body validation enabled and no digest header is present", function()
         local date = os.date("!%a, %d %b %Y %H:%M:%S GMT")
         local postBody = '{"a":"apple","b":"ball"}'
         local sha256 = resty_sha256:new()
@@ -907,7 +945,7 @@ for _, strategy in helpers.each_strategy() do
             authorization = hmacAuth,
           }
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal("HMAC signature does not match", body.message)
       end)
@@ -968,6 +1006,22 @@ for _, strategy in helpers.each_strategy() do
         assert.equal("true", body.headers["x-anonymous-consumer"])
         assert.equal('no-body', body.headers["x-consumer-username"])
       end)
+
+      it("should pass with invalid credentials and username in anonymous", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          body    = {},
+          headers = {
+            ["HOST"] = "hmacauth7.com",
+          },
+        })
+        local body = assert.res_status(200, res)
+        body = cjson.decode(body)
+        assert.equal("true", body.headers["x-anonymous-consumer"])
+        assert.equal('no-body', body.headers["x-consumer-username"])
+      end)
+
       it("errors when anonymous user doesn't exist", function()
         finally(function()
           proxy_client = helpers.proxy_client()
@@ -1072,7 +1126,7 @@ for _, strategy in helpers.each_strategy() do
             authorization = hmacAuth,
           },
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal("HMAC signature does not match", body.message)
       end)
@@ -1099,7 +1153,7 @@ for _, strategy in helpers.each_strategy() do
             authorization = hmacAuth,
           },
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal("HMAC signature does not match", body.message)
       end)
@@ -1126,7 +1180,7 @@ for _, strategy in helpers.each_strategy() do
             authorization = hmacAuth,
           }
         })
-        local body = assert.res_status(403, res)
+        local body = assert.res_status(401, res)
         body = cjson.decode(body)
         assert.equal("HMAC signature does not match", body.message)
       end)
@@ -1154,7 +1208,7 @@ for _, strategy in helpers.each_strategy() do
       end)
 
       it("should pass with GET with request-line having query param but signed without query param", function()
-        -- hmac-auth needs to validate signatures created both with and without 
+        -- hmac-auth needs to validate signatures created both with and without
         -- query params for a supported deprecation period.
         --
         -- Regression for https://github.com/Kong/kong/issues/3672
@@ -1409,7 +1463,7 @@ for _, strategy in helpers.each_strategy() do
             ["content-md5"]         = "md5",
           },
         })
-        assert.res_status(403, res)
+        assert.res_status(401, res)
       end)
 
       it("should pass with GET with hmac-sha384", function()
@@ -1475,10 +1529,10 @@ for _, strategy in helpers.each_strategy() do
             ["content-md5"]         = "md5",
           },
         })
-        assert.res_status(403, res)
+        assert.res_status(401, res)
       end)
 
-      it("should return a 403 with an invalid authorization header", function()
+      it("should return a 401 with an invalid authorization header", function()
         local date = os.date("!%a, %d %b %Y %H:%M:%S GMT")
         local res = assert(proxy_client:send {
           method  = "GET",
@@ -1490,7 +1544,7 @@ for _, strategy in helpers.each_strategy() do
             ["proxy-authorization"] = "this is no hmac token at all is it?",
           },
         })
-        assert.res_status(403, res)
+        assert.res_status(401, res)
       end)
 
       it("should pass with hmac-sha1", function()

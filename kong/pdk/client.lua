@@ -7,6 +7,7 @@
 -- @module kong.client
 
 
+local utils = require "kong.tools.utils"
 local phase_checker = require "kong.pdk.private.phases"
 
 
@@ -148,6 +149,51 @@ local function new(self)
 
 
   ---
+  -- Returns the consumer from the datastore (or cache).
+  -- Will look up the consumer by id, and optionally will do a second search by name.
+  -- @function kong.client.load_consumer
+  -- @phases access, header_filter, body_filter, log
+  -- @tparam string consumer_id The consumer id to look up.
+  -- @tparam [opt] search_by_username boolean. If truthy,
+  -- then if the consumer was not found by id,
+  -- then a second search by username will be performed
+  -- @treturn table|nil consumer entity or nil
+  -- @treturn nil|err nil if success, or error message if failure
+  -- @usage
+  -- local consumer_id = "john_doe"
+  -- local consumer = kong.client.load_consumer(consumer_id, true)
+  function _CLIENT.load_consumer(consumer_id, search_by_username)
+    check_phase(AUTH_AND_LATER)
+
+    if not consumer_id or type(consumer_id) ~= "string" then
+      error("consumer_id must be a string", 2)
+    end
+
+    if not utils.is_valid_uuid(consumer_id) and not search_by_username then
+      error("cannot load a consumer with an id that is not a uuid", 2)
+    end
+
+    if utils.is_valid_uuid(consumer_id) then
+      local result, err = kong.db.consumers:select { id = consumer_id }
+
+      if result then
+        return result
+      end
+
+      if err then
+        return nil, err
+      end
+    end
+
+    -- no error and if search_by_username, look up by username
+    if search_by_username then
+      return kong.db.consumers:select_by_username(consumer_id)
+    end
+
+  end
+
+
+  ---
   -- Returns the `consumer` entity of the currently authenticated consumer.
   -- If not set yet, it returns `nil`.
   -- @function kong.client.get_consumer
@@ -196,6 +242,48 @@ local function new(self)
     local ctx = ngx.ctx
     ctx.authenticated_consumer = consumer
     ctx.authenticated_credential = credential
+  end
+
+
+  ---
+  -- Returns the protocol matched by the current route (`"http"`, `"https"`, `"tcp"` or
+  -- `"tls"`), or `nil`, if no route has been matched, which can happen when dealing with
+  -- erroneous requests.
+  -- @function kong.client.get_protocol
+  -- @phases access, header_filter, body_filter, log
+  -- @tparam [opt] allow_terminated boolean. If set, the `X-Forwarded-Proto` header will be checked when checking for https
+  -- @treturn string|nil `"http"`, `"https"`, `"tcp"`, `"tls"` or `nil`
+  -- @treturn nil|err nil if success, or error message if failure
+  -- @usage
+  -- kong.client.get_protocol() -- "http"
+  function _CLIENT.get_protocol(allow_terminated)
+    check_phase(AUTH_AND_LATER)
+
+    local route = ngx.ctx.route
+    if not route then
+      return nil, "No active route found"
+    end
+
+    local protocols = route.protocols
+    if #protocols == 1 then
+      return protocols[1]
+    end
+
+    if ngx.config.subsystem == "http" then
+      local is_trusted = self.ip.is_trusted(self.client.get_ip())
+      local is_https, err = utils.check_https(is_trusted, allow_terminated)
+      if err then
+        return nil, err
+      end
+
+      return is_https and "https" or "http"
+    end
+    -- else subsystem is stream
+
+    local balancer_data = ngx.ctx.balancer_data
+    local is_tls = balancer_data and balancer_data.scheme == "tls"
+
+    return is_tls and "tls" or "tcp"
   end
 
 

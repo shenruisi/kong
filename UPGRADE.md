@@ -1,5 +1,5 @@
 This document guides you through the process of upgrading Kong. First, check if
-a section named "Upgrade to Kong `x.x.x`" exists, with `x.x.x` being the version
+a section named "Upgrade to `x.x.x`" exists, with `x.x.x` being the version
 you are planning to upgrade to. If such a section does not exist, the upgrade
 you want to perform does not have any particular instructions, and you can
 simply consult the [Suggested upgrade path](#suggested-upgrade-path).
@@ -36,7 +36,1102 @@ starts new workers, which take over from old workers before those old workers
 are terminated. In this way, Kong will serve new requests via the new
 configuration, without dropping existing in-flight connections.
 
-### Upgrading `1.0.x` patch releases
+
+## Upgrade to `2.0.0`
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor" and "patch" versions. The upgrade path
+will be different on which previous version from which you are migrating.
+Upgrading into 2.0.x is a major version upgrade, so be aware of any
+breaking changes listed in the [CHANGELOG.md](https://github.com/Kong/kong/blob/2.0.0/CHANGELOG.md) document.
+
+
+#### 1. Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+are bundled and you can skip this section.
+
+If you are building your dependencies by hand, there are changes since the
+previous release, so you will need to rebuild them with the latest patches.
+
+The required OpenResty version is
+[1.15.8.2](http://openresty.org/en/changelog-1015008.html), and the
+the set of [OpenResty
+patches](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools/openresty-patches)
+included has changed, including the latest release of
+[lua-kong-nginx-module](https://github.com/Kong/lua-kong-nginx-module).
+Our [kong-build-tools](https://github.com/Kong/kong-build-tools)
+repository allows you to build OpenResty with the necessary patches
+and modules easily.
+
+For Go support, you also need the [Kong go-pluginserver](https://github.com/kong/go-pluginserver).
+This is bundled with Kong binary packages and it is automatically started by
+Kong if Go plugin support is enabled in Kong's configuration.
+Note that the Go version used to compile any Go plugins needs to match the Go
+version of the `go-pluginserver`. You can check the Go version used to
+build the `go-pluginserver` binary running `go-pluginserver -version`.
+
+
+#### 2. Breaking Changes
+
+Kong 2.0.0 does include a few breaking changes over Kong 1.x, all of them
+related to the removal of service mesh:
+
+- **Removed Service Mesh support** - That has been deprecated in Kong 1.4
+  and made off-by-default already, and the code is now be gone in 2.0.
+  For Service Mesh, we now have [Kuma](https://kuma.io), which is something
+  designed for Mesh patterns from day one, so we feel at peace with removing
+  Kong's native Service Mesh functionality and focus on its core capabilities
+  as a gateway.
+- As part of service mesh removal, serviceless proxying was removed.
+  You can still set `service = null` when creating a route for use with
+  serverless plugins such as `aws-lambda`, or `request-termination`.
+- Removed the `origins` property.
+- Removed the `transparent` property.
+- Removed the Sidecar Injector plugin which was used for service mesh.
+- The **Nginx configuration file has changed**, which means that you need to update
+  it if you are using a custom template. Changes were made to improve
+  stream mode support and to make the Nginx injections system more
+  powerful so that custom templates are less of a necessity. The changes
+  are detailed in a diff included below.
+  - :warning: Note that the `kong_cache` shm was split into two
+    shms: `kong_core_cache` and `kong_cache`. If you are using a
+    custom Nginx template, make sure core cache shared dictionaries
+    are defined, including db-less mode shadow definitions.
+    Both cache values rely on the already existent `mem_cache_size`
+    configuration option to set their size, so when upgrading from
+    a previous Kong version, the cache memory consumption might
+    double if this value is not adjusted.
+
+<details>
+<summary><strong>Click here to see the Nginx configuration changes</strong></summary>
+<p>
+
+```diff
+diff --git a/kong/templates/nginx_kong.lua b/kong/templates/nginx_kong.lua
+index 5c6c1db03..6b4b4a818 100644
+--- a/kong/templates/nginx_kong.lua
++++ b/kong/templates/nginx_kong.lua
+@@ -5,52 +5,46 @@ server_tokens off;
+ > if anonymous_reports then
+ ${{SYSLOG_REPORTS}}
+ > end
+-
+ error_log ${{PROXY_ERROR_LOG}} ${{LOG_LEVEL}};
+
+-> if nginx_optimizations then
+->-- send_timeout 60s;          # default value
+->-- keepalive_timeout 75s;     # default value
+->-- client_body_timeout 60s;   # default value
+->-- client_header_timeout 60s; # default value
+->-- tcp_nopush on;             # disabled until benchmarked
+->-- proxy_buffer_size 128k;    # disabled until benchmarked
+->-- proxy_buffers 4 256k;      # disabled until benchmarked
+->-- proxy_busy_buffers_size 256k; # disabled until benchmarked
+->-- reset_timedout_connection on; # disabled until benchmarked
+-> end
+-
+-client_max_body_size ${{CLIENT_MAX_BODY_SIZE}};
+-proxy_ssl_server_name on;
+-underscores_in_headers on;
+-
+ lua_package_path       '${{LUA_PACKAGE_PATH}};;';
+ lua_package_cpath      '${{LUA_PACKAGE_CPATH}};;';
+ lua_socket_pool_size   ${{LUA_SOCKET_POOL_SIZE}};
++lua_socket_log_errors  off;
+ lua_max_running_timers 4096;
+ lua_max_pending_timers 16384;
++lua_ssl_verify_depth   ${{LUA_SSL_VERIFY_DEPTH}};
++> if lua_ssl_trusted_certificate then
++lua_ssl_trusted_certificate '${{LUA_SSL_TRUSTED_CERTIFICATE}}';
++> end
++
+ lua_shared_dict kong                        5m;
++lua_shared_dict kong_locks                  8m;
++lua_shared_dict kong_healthchecks           5m;
++lua_shared_dict kong_process_events         5m;
++lua_shared_dict kong_cluster_events         5m;
++lua_shared_dict kong_rate_limiting_counters 12m;
++lua_shared_dict kong_core_db_cache          ${{MEM_CACHE_SIZE}};
++lua_shared_dict kong_core_db_cache_miss     12m;
+ lua_shared_dict kong_db_cache               ${{MEM_CACHE_SIZE}};
+-> if database == "off" then
+-lua_shared_dict kong_db_cache_2     ${{MEM_CACHE_SIZE}};
+-> end
+ lua_shared_dict kong_db_cache_miss          12m;
+ > if database == "off" then
++lua_shared_dict kong_core_db_cache_2        ${{MEM_CACHE_SIZE}};
++lua_shared_dict kong_core_db_cache_miss_2   12m;
++lua_shared_dict kong_db_cache_2             ${{MEM_CACHE_SIZE}};
+ lua_shared_dict kong_db_cache_miss_2        12m;
+ > end
+-lua_shared_dict kong_locks          8m;
+-lua_shared_dict kong_process_events 5m;
+-lua_shared_dict kong_cluster_events 5m;
+-lua_shared_dict kong_healthchecks   5m;
+-lua_shared_dict kong_rate_limiting_counters 12m;
+ > if database == "cassandra" then
+ lua_shared_dict kong_cassandra              5m;
+ > end
+-lua_socket_log_errors off;
+-> if lua_ssl_trusted_certificate then
+-lua_ssl_trusted_certificate '${{LUA_SSL_TRUSTED_CERTIFICATE}}';
++> if role == "control_plane" then
++lua_shared_dict kong_clustering             5m;
++> end
++
++underscores_in_headers on;
++> if ssl_ciphers then
++ssl_ciphers ${{SSL_CIPHERS}};
+ > end
+-lua_ssl_verify_depth ${{LUA_SSL_VERIFY_DEPTH}};
+
+ # injected nginx_http_* directives
+ > for _, el in ipairs(nginx_http_directives) do
+@@ -66,61 +60,47 @@ init_worker_by_lua_block {
+     Kong.init_worker()
+ }
+
+-
+-> if #proxy_listeners > 0 then
++> if (role == "traditional" or role == "data_plane") and #proxy_listeners > 0 then
+ upstream kong_upstream {
+     server 0.0.0.1;
+     balancer_by_lua_block {
+         Kong.balancer()
+     }
+
+-# injected nginx_http_upstream_* directives
+-> for _, el in ipairs(nginx_http_upstream_directives) do
++    # injected nginx_upstream_* directives
++> for _, el in ipairs(nginx_upstream_directives) do
+     $(el.name) $(el.value);
+ > end
+ }
+
+ server {
+     server_name kong;
+-> for i = 1, #proxy_listeners do
+-    listen $(proxy_listeners[i].listener);
++> for _, entry in ipairs(proxy_listeners) do
++    listen $(entry.listener);
+ > end
++
+     error_page 400 404 408 411 412 413 414 417 494 /kong_error_handler;
+     error_page 500 502 503 504                     /kong_error_handler;
+
+     access_log ${{PROXY_ACCESS_LOG}};
+     error_log  ${{PROXY_ERROR_LOG}} ${{LOG_LEVEL}};
+
+-    client_body_buffer_size ${{CLIENT_BODY_BUFFER_SIZE}};
+-
+ > if proxy_ssl_enabled then
+     ssl_certificate     ${{SSL_CERT}};
+     ssl_certificate_key ${{SSL_CERT_KEY}};
++    ssl_session_cache   shared:SSL:10m;
+     ssl_certificate_by_lua_block {
+         Kong.ssl_certificate()
+     }
+-
+-    ssl_session_cache shared:SSL:10m;
+-    ssl_session_timeout 10m;
+-    ssl_prefer_server_ciphers on;
+-    ssl_ciphers ${{SSL_CIPHERS}};
+-> end
+-
+-> if client_ssl then
+-    proxy_ssl_certificate ${{CLIENT_SSL_CERT}};
+-    proxy_ssl_certificate_key ${{CLIENT_SSL_CERT_KEY}};
+-> end
+-
+-    real_ip_header     ${{REAL_IP_HEADER}};
+-    real_ip_recursive  ${{REAL_IP_RECURSIVE}};
+-> for i = 1, #trusted_ips do
+-    set_real_ip_from   $(trusted_ips[i]);
+ > end
+
+     # injected nginx_proxy_* directives
+ > for _, el in ipairs(nginx_proxy_directives) do
+     $(el.name) $(el.value);
+ > end
++> for i = 1, #trusted_ips do
++    set_real_ip_from  $(trusted_ips[i]);
++> end
+
+     rewrite_by_lua_block {
+         Kong.rewrite()
+@@ -171,43 +151,93 @@ server {
+         proxy_pass_header     Server;
+         proxy_pass_header     Date;
+         proxy_ssl_name        $upstream_host;
++        proxy_ssl_server_name on;
++> if client_ssl then
++        proxy_ssl_certificate ${{CLIENT_SSL_CERT}};
++        proxy_ssl_certificate_key ${{CLIENT_SSL_CERT_KEY}};
++> end
+         proxy_pass            $upstream_scheme://kong_upstream$upstream_uri;
+     }
+
+     location @grpc {
+         internal;
++        default_type         '';
+         set $kong_proxy_mode 'grpc';
+
++        grpc_set_header      TE                $upstream_te;
+         grpc_set_header      Host              $upstream_host;
+         grpc_set_header      X-Forwarded-For   $upstream_x_forwarded_for;
+         grpc_set_header      X-Forwarded-Proto $upstream_x_forwarded_proto;
+         grpc_set_header      X-Forwarded-Host  $upstream_x_forwarded_host;
+         grpc_set_header      X-Forwarded-Port  $upstream_x_forwarded_port;
+         grpc_set_header      X-Real-IP         $remote_addr;
+-
++        grpc_pass_header     Server;
++        grpc_pass_header     Date;
+         grpc_pass            grpc://kong_upstream;
+     }
+
+     location @grpcs {
+         internal;
++        default_type         '';
+         set $kong_proxy_mode 'grpc';
+
++        grpc_set_header      TE                $upstream_te;
+         grpc_set_header      Host              $upstream_host;
+         grpc_set_header      X-Forwarded-For   $upstream_x_forwarded_for;
+         grpc_set_header      X-Forwarded-Proto $upstream_x_forwarded_proto;
+         grpc_set_header      X-Forwarded-Host  $upstream_x_forwarded_host;
+         grpc_set_header      X-Forwarded-Port  $upstream_x_forwarded_port;
+         grpc_set_header      X-Real-IP         $remote_addr;
+-
++        grpc_pass_header     Server;
++        grpc_pass_header     Date;
++        grpc_ssl_name        $upstream_host;
++        grpc_ssl_server_name on;
++> if client_ssl then
++        grpc_ssl_certificate ${{CLIENT_SSL_CERT}};
++        grpc_ssl_certificate_key ${{CLIENT_SSL_CERT_KEY}};
++> end
+         grpc_pass            grpcs://kong_upstream;
+     }
+
++    location = /kong_buffered_http {
++        internal;
++        default_type         '';
++        set $kong_proxy_mode 'http';
++
++        rewrite_by_lua_block       {;}
++        access_by_lua_block        {;}
++        header_filter_by_lua_block {;}
++        body_filter_by_lua_block   {;}
++        log_by_lua_block           {;}
++
++        proxy_http_version 1.1;
++        proxy_set_header      TE                $upstream_te;
++        proxy_set_header      Host              $upstream_host;
++        proxy_set_header      Upgrade           $upstream_upgrade;
++        proxy_set_header      Connection        $upstream_connection;
++        proxy_set_header      X-Forwarded-For   $upstream_x_forwarded_for;
++        proxy_set_header      X-Forwarded-Proto $upstream_x_forwarded_proto;
++        proxy_set_header      X-Forwarded-Host  $upstream_x_forwarded_host;
++        proxy_set_header      X-Forwarded-Port  $upstream_x_forwarded_port;
++        proxy_set_header      X-Real-IP         $remote_addr;
++        proxy_pass_header     Server;
++        proxy_pass_header     Date;
++        proxy_ssl_name        $upstream_host;
++        proxy_ssl_server_name on;
++> if client_ssl then
++        proxy_ssl_certificate ${{CLIENT_SSL_CERT}};
++        proxy_ssl_certificate_key ${{CLIENT_SSL_CERT_KEY}};
++> end
++        proxy_pass            $upstream_scheme://kong_upstream$upstream_uri;
++    }
++
+     location = /kong_error_handler {
+         internal;
++        default_type                 '';
++
+         uninitialized_variable_warn  off;
+
+         rewrite_by_lua_block {;}
+-
+         access_by_lua_block  {;}
+
+         content_by_lua_block {
+@@ -215,13 +245,13 @@ server {
+         }
+     }
+ }
+-> end
++> end -- (role == "traditional" or role == "data_plane") and #proxy_listeners > 0
+
+-> if #admin_listeners > 0 then
++> if (role == "control_plane" or role == "traditional") and #admin_listeners > 0 then
+ server {
+     server_name kong_admin;
+-> for i = 1, #admin_listeners do
+-    listen $(admin_listeners[i].listener);
++> for _, entry in ipairs(admin_listeners) do
++    listen $(entry.listener);
+ > end
+
+     access_log ${{ADMIN_ACCESS_LOG}};
+@@ -233,11 +263,7 @@ server {
+ > if admin_ssl_enabled then
+     ssl_certificate     ${{ADMIN_SSL_CERT}};
+     ssl_certificate_key ${{ADMIN_SSL_CERT_KEY}};
+-
+-    ssl_session_cache shared:SSL:10m;
+-    ssl_session_timeout 10m;
+-    ssl_prefer_server_ciphers on;
+-    ssl_ciphers ${{SSL_CIPHERS}};
++    ssl_session_cache   shared:AdminSSL:10m;
+ > end
+
+     # injected nginx_admin_* directives
+@@ -265,20 +291,20 @@ server {
+         return 200 'User-agent: *\nDisallow: /';
+     }
+ }
+-> end
++> end -- (role == "control_plane" or role == "traditional") and #admin_listeners > 0
+
+ > if #status_listeners > 0 then
+ server {
+     server_name kong_status;
+-> for i = 1, #status_listeners do
+-    listen $(status_listeners[i].listener);
++> for _, entry in ipairs(status_listeners) do
++    listen $(entry.listener);
+ > end
+
+     access_log ${{STATUS_ACCESS_LOG}};
+     error_log  ${{STATUS_ERROR_LOG}} ${{LOG_LEVEL}};
+
+-    # injected nginx_http_status_* directives
+-> for _, el in ipairs(nginx_http_status_directives) do
++    # injected nginx_status_* directives
++> for _, el in ipairs(nginx_status_directives) do
+     $(el.name) $(el.value);
+ > end
+
+@@ -303,4 +329,26 @@ server {
+     }
+ }
+ > end
++
++> if role == "control_plane" then
++server {
++    server_name kong_cluster_listener;
++> for _, entry in ipairs(cluster_listeners) do
++    listen $(entry.listener) ssl;
++> end
++
++    access_log off;
++
++    ssl_verify_client   optional_no_ca;
++    ssl_certificate     ${{CLUSTER_CERT}};
++    ssl_certificate_key ${{CLUSTER_CERT_KEY}};
++    ssl_session_cache   shared:ClusterSSL:10m;
++
++    location = /v1/outlet {
++        content_by_lua_block {
++            Kong.serve_cluster_listener()
++        }
++    }
++}
++> end -- role == "control_plane"
+ ]]
+```
+
+</p>
+</details>
+
+
+#### 3. Suggested Upgrade Path
+
+##### Upgrade from `0.x` to `2.0.0`
+
+The lowest version that Kong 2.0.0 supports migrating from is 1.0.0.
+If you are migrating from a version lower than 0.14.1, you need to
+migrate to 0.14.1 first. Then, once you are migrating from 0.14.1,
+please migrate to 1.5.0 first.
+
+The steps for upgrading from 0.14.1 to 1.5.0 are the same as upgrading
+from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the [Suggested Upgrade Path for Kong
+1.0](#kong-1-0-upgrade-path), with the addition of the `kong
+migrations migrate-apis` command, which you can use to migrate legacy
+`apis` configurations.
+
+Once you migrated to 1.5.0, you can follow the instructions in the section
+below to migrate to 2.0.0.
+
+##### Upgrade from `1.0.0` - `1.5.0` to `2.0.0`
+
+Kong 2.0.0 supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that there is no need to fully copy
+the data, but this also means that they are designed in such a way so that
+the new version of Kong is able to use the data as it is migrated, and to do
+it in a way so that the old Kong cluster keeps working until it is finally
+time to decommission it. For this reason, the full migration is now split into
+two steps, which are performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 2.0.0).
+
+1. Download 2.0.0, and configure it to point to the same datastore
+   as your old (1.0 to 1.5) cluster. Run `kong migrations up`.
+2. Once that finishes running, both the old and new (2.0.0) clusters can now
+   run simultaneously on the same datastore. Start provisioning
+   2.0.0 nodes, but do not use their Admin API yet. If you need to
+   perform Admin API requests, these should be made to the old cluster's nodes.
+   The reason is to prevent the new cluster from generating data
+   that is not understood by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 2.0.0 cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 2.0.0 cluster,
+   decommission your old nodes.
+5. From your 2.0.0 cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 2.0.0 nodes.
+
+##### Installing 2.0.0 on a Fresh Datastore
+
+The following commands should be used to prepare a new 2.0.0 cluster from a
+fresh datastore:
+
+```
+$ kong migrations bootstrap [-c config]
+$ kong start [-c config]
+```
+
+
+## Upgrade to `1.5.0`
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor" and "patch" versions. The upgrade path
+will be different on which previous version from which you are migrating.
+If you are upgrading from 0.x, this is a major upgrade. If you are
+upgrading from 1.0.x or 1.4.x, this is a minor upgrade. Both scenarios are
+explained below.
+
+#### 1. Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+are bundled. If you are building your dependencies by hand, since Kong 1.4.0 the
+only dependency upgraded is
+[lua-resty-healthcheck](https://github.com/Kong/lua-resty-healthcheck) that must
+be at least the 1.1.2 version from now on. For any lower version you should
+check the upgrade path for the correct dependencies.
+
+#### 2. Breaking Changes
+
+Kong 1.5.0 does not include any breaking changes over Kong 1.4, but Kong 1.3
+included breaking changes in configuration and for routing in some edge-cases
+over Kong 1.2, and Kong 1.0 included a number of breaking changes over Kong 0.x.
+If you are upgrading from 1.2, please read the section on
+[Kong 1.3 Breaking Changes](#kong-1-3-breaking-changes) carefully before
+proceeding. If you are upgrading from 0.14,x, please read the section on
+[Kong 1.0 Breaking Changes](#kong-1-0-breaking-changes) carefully before
+proceeding.
+
+#### 3. Suggested Upgrade Path
+
+##### Upgrade from `0.x` to `1.5.0`
+
+The lowest version that Kong 1.5.0 supports migrating from is 0.14.1. if you
+are migrating from a previous 0.x release, please migrate to 0.14.1 first.
+
+For upgrading from 0.14.1 to Kong 1.5.0, the steps for upgrading are the same
+as upgrading from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the [Suggested Upgrade Path for Kong
+1.0](#kong-1-0-upgrade-path).
+
+##### Upgrade from `1.0.x` - `1.4.x` to `1.5.0`
+
+Kong 1.5.0 supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that there is no need to fully copy
+the data, but this also means that they are designed in such a way so that
+the new version of Kong is able to use the data as it is migrated, and to do
+it in a way so that the old Kong cluster keeps working until it is finally
+time to decommission it. For this reason, the full migration is now split into
+two steps, which are performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 1.5.0).
+
+1. Download 1.5.0, and configure it to point to the same datastore
+   as your old (1.0 to 1.4) cluster. Run `kong migrations up`.
+2. Once that finishes running, both the old and new (1.5.0) clusters can now
+   run simultaneously on the same datastore. Start provisioning
+   1.5.0 nodes, but do not use their Admin API yet. If you need to
+   perform Admin API requests, these should be made to the old cluster's nodes.
+   The reason is to prevent the new cluster from generating data
+   that is not understood by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 1.5.0 cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 1.5.0 cluster,
+   decommission your old nodes.
+5. From your 1.5.0 cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 1.5.0 nodes.
+
+##### Installing 1.5.0 on a Fresh Datastore
+
+The following commands should be used to prepare a new 1.5.0 cluster from a
+fresh datastore:
+
+```
+$ kong migrations bootstrap [-c config]
+$ kong start [-c config]
+```
+
+
+## Upgrade to `1.4.0`
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor" and "patch" versions. The upgrade path
+will be different on which previous version from which you are migrating.
+If you are upgrading from 0.x, this is a major upgrade. If you are
+upgrading from 1.0.x or 1.3.x, this is a minor upgrade. Both scenarios are
+explained below.
+
+
+#### 1. Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+are bundled. If you are building your dependencies by hand, there are no changes
+in dependencies from 1.3.0, for any lower version you should check the upgrade
+path for the correct dependencies.
+
+#### 2. Breaking Changes
+
+Kong 1.4.0 does not include any breaking changes over Kong 1.3, but Kong 1.3
+included breaking changes in configuration and for routing in some edge-cases
+over Kong 1.2, and Kong 1.0 included a number of breaking changes over Kong 0.x.
+If you are upgrading from 1.2, please read the section on
+[Kong 1.3 Breaking Changes](#kong-1-3-breaking-changes) carefully before
+proceeding. If you are upgrading from 0.14,x, please read the section on
+[Kong 1.0 Breaking Changes](#kong-1-0-breaking-changes) carefully before
+proceeding.
+
+#### 3. Suggested Upgrade Path
+
+##### Upgrade from `0.x` to `1.4.0`
+
+The lowest version that Kong 1.4.0 supports migrating from is 0.14.1. if you
+are migrating from a previous 0.x release, please migrate to 0.14.1 first.
+
+For upgrading from 0.14.1 to Kong 1.4.0, the steps for upgrading are the same
+as upgrading from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the [Suggested Upgrade Path for Kong
+1.0](#kong-1-0-upgrade-path).
+
+##### Upgrade from `1.0.x` - `1.3.x` to `1.4.0`
+
+Kong 1.4.0 supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that there is no need to fully copy
+the data, but this also means that they are designed in such a way so that
+the new version of Kong is able to use the data as it is migrated, and to do
+it in a way so that the old Kong cluster keeps working until it is finally
+time to decommission it. For this reason, the full migration is now split into
+two steps, which are performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 1.4.0).
+
+1. Download 1.4.0, and configure it to point to the same datastore
+   as your old (1.0 to 1.3) cluster. Run `kong migrations up`.
+2. Once that finishes running, both the old and new (1.4.0) clusters can now
+   run simultaneously on the same datastore. Start provisioning
+   1.4.0 nodes, but do not use their Admin API yet. If you need to
+   perform Admin API requests, these should be made to the old cluster's nodes.
+   The reason is to prevent the new cluster from generating data
+   that is not understood by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 1.4.0 cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 1.4.0 cluster,
+   decommission your old nodes.
+5. From your 1.4.0 cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 1.4.0 nodes.
+
+##### Installing 1.4.0 on a Fresh Datastore
+
+The following commands should be used to prepare a new 1.4.0 cluster from a
+fresh datastore:
+
+```
+$ kong migrations bootstrap [-c config]
+$ kong start [-c config]
+```
+
+## Upgrade to `1.3`
+
+#### 1. Breaking Changes
+
+##### Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+are bundled. If you are building your dependencies by hand, you should
+be aware of the following changes:
+
+- The required OpenResty version has been bumped to
+  [1.15.8.1](http://openresty.org/en/changelog-1015008.html). If you are
+  installing Kong from one of our distribution packages, you are not affected
+  by this change.
+- From this version on, the new
+  [lua-kong-nginx-module](https://github.com/Kong/lua-kong-nginx-module) Nginx
+  module is **required** to be built into OpenResty for Kong to function
+  properly. If you are installing Kong from one of our distribution packages,
+  you are not affected by this change.
+  [openresty-build-tools#26](https://github.com/Kong/openresty-build-tools/pull/26)
+
+**Note:** if you are not using one of our distribution packages and compiling
+OpenResty from source, you must still apply Kong's [OpenResty
+patches](https://github.com/kong/openresty-patches) (and, as highlighted above,
+compile OpenResty with the new lua-kong-nginx-module). Our new
+[openresty-build-tools](https://github.com/Kong/openresty-build-tools)
+repository will allow you to do both easily.
+
+##### Core
+
+- Bugfixes in the router *may, in some edge-cases*, result in different Routes
+  being matched. It was reported to us that the router behaved incorrectly in
+  some cases when configuring wildcard Hosts and regex paths (e.g.
+  [#3094](https://github.com/Kong/kong/issues/3094)). It may be so that you are
+  subject to these bugs without realizing it. Please ensure that wildcard Hosts
+  and regex paths Routes you have configured are matching as expected before
+  upgrading.
+  [9ca4dc0](https://github.com/Kong/kong/commit/9ca4dc09fdb12b340531be8e0f9d1560c48664d5)
+  [2683b86](https://github.com/Kong/kong/commit/2683b86c2f7680238e3fe85da224d6f077e3425d)
+  [6a03e1b](https://github.com/Kong/kong/commit/6a03e1bd95594716167ccac840ff3e892ed66215)
+- Upstream connections are now only kept-alive for 100 requests or 60 seconds
+  (idle) by default. Previously, upstream connections were not actively closed
+  by Kong. This is a (non-breaking) change in behavior inherited from Nginx
+  1.15, and configurable via new configuration properties.
+
+##### Configuration
+
+- The `upstream_keepalive` configuration property is deprecated, and replaced
+  by the new `nginx_http_upstream_keepalive` property. Its behavior is almost
+  identical, but the notable difference is that the latter leverages the
+  [injected Nginx
+  directives](https://konghq.com/blog/kong-ce-nginx-injected-directives/)
+  feature added in Kong 0.14.0.
+- The Nginx configuration file has changed, which means that you need to update
+  it if you are using a custom template. Changes were made to address the
+  `upstream_keepalive` change, the new gRPC support, and to make `ssl_protocols`
+  load via injected directives. The changes are detailed in a diff
+  included below.
+
+<details>
+<summary><strong>Click here to see the Nginx configuration changes</strong></summary>
+<p>
+
+```diff
+diff --git a/kong/templates/nginx_kong.lua b/kong/templates/nginx_kong.lua
+index 761376a07..5a957a1b7 100644
+--- a/kong/templates/nginx_kong.lua
++++ b/kong/templates/nginx_kong.lua
+@@ -72,8 +72,10 @@ upstream kong_upstream {
+     balancer_by_lua_block {
+         Kong.balancer()
+     }
+-> if upstream_keepalive > 0 then
+-    keepalive ${{UPSTREAM_KEEPALIVE}};
++
++# injected nginx_http_upstream_* directives
++> for _, el in ipairs(nginx_http_upstream_directives) do
++    $(el.name) $(el.value);
+ > end
+ }
+
+@@ -93,7 +95,6 @@ server {
+ > if proxy_ssl_enabled then
+     ssl_certificate ${{SSL_CERT}};
+     ssl_certificate_key ${{SSL_CERT_KEY}};
+-    ssl_protocols TLSv1.1 TLSv1.2 TLSv1.3;
+     ssl_certificate_by_lua_block {
+         Kong.ssl_certificate()
+     }
+@@ -120,6 +121,26 @@ server {
+     $(el.name) $(el.value);
+ > end
+
++    rewrite_by_lua_block {
++        Kong.rewrite()
++    }
++
++    access_by_lua_block {
++        Kong.access()
++    }
++
++    header_filter_by_lua_block {
++        Kong.header_filter()
++    }
++
++    body_filter_by_lua_block {
++        Kong.body_filter()
++    }
++
++    log_by_lua_block {
++        Kong.log()
++    }
++
+     location / {
+         default_type                     '';
+
+@@ -134,14 +155,7 @@ server {
+         set $upstream_x_forwarded_proto  '';
+         set $upstream_x_forwarded_host   '';
+         set $upstream_x_forwarded_port   '';
+-
+-        rewrite_by_lua_block {
+-            Kong.rewrite()
+-        }
+-
+-        access_by_lua_block {
+-            Kong.access()
+-        }
++        set $kong_proxy_mode             'http';
+
+         proxy_http_version 1.1;
+         proxy_set_header   TE                $upstream_te;
+@@ -157,38 +171,32 @@ server {
+         proxy_pass_header  Date;
+         proxy_ssl_name     $upstream_host;
+         proxy_pass         $upstream_scheme://kong_upstream$upstream_uri;
++    }
+
+-        header_filter_by_lua_block {
+-            Kong.header_filter()
+-        }
++    location @grpc {
++        internal;
+
+-        body_filter_by_lua_block {
+-            Kong.body_filter()
+-        }
++        set $kong_proxy_mode       'grpc';
++        grpc_pass grpc://kong_upstream;
++    }
+
+-        log_by_lua_block {
+-            Kong.log()
+-        }
++    location @grpcs {
++        internal;
++
++        set $kong_proxy_mode       'grpcs';
++        grpc_pass grpcs://kong_upstream;
+     }
+
+     location = /kong_error_handler {
+         internal;
+         uninitialized_variable_warn off;
+
+-        content_by_lua_block {
+-            Kong.handle_error()
+-        }
+-
+-        header_filter_by_lua_block {
+-            Kong.header_filter()
+-        }
++        rewrite_by_lua_block {;}
+
+-        body_filter_by_lua_block {
+-            Kong.body_filter()
+-        }
++        access_by_lua_block {;}
+
+-        log_by_lua_block {
+-            Kong.log()
++        content_by_lua_block {
++            Kong.handle_error()
+         }
+     }
+ }
+@@ -210,7 +218,6 @@ server {
+ > if admin_ssl_enabled then
+     ssl_certificate ${{ADMIN_SSL_CERT}};
+     ssl_certificate_key ${{ADMIN_SSL_CERT_KEY}};
+-    ssl_protocols TLSv1.1 TLSv1.2 TLSv1.3;
+
+     ssl_session_cache shared:SSL:10m;
+     ssl_session_timeout 10m;
+```
+
+</p>
+</details>
+
+#### 2. Suggested Upgrade Path
+
+##### Upgrade from `0.x` to `1.3`
+
+The lowest version that Kong 1.3 supports migrating from is 0.14.1. if you
+are migrating from a previous 0.x release, please migrate to 0.14.1 first.
+
+For upgrading from 0.14.1 to Kong 1.3, the steps for upgrading are the same as
+upgrading from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the [Suggested Upgrade Path for Kong
+1.0](#kong-1-0-upgrade-path).
+
+##### Upgrade from `1.0.x` - `1.2.x` to `1.3`
+
+Kong 1.3 supports the no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that there is no need to fully copy
+the data, but this also means that they are designed in such a way so that
+the new version of Kong is able to use the data as it is migrated, and to do
+it in a way so that the old Kong cluster keeps working until it is finally
+time to decommission it. For this reason, the full migration is now split into
+two steps, which are performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 1.2).
+
+1. Download 1.3, and configure it to point to the same datastore as your old
+   (1.0 - 1.2) cluster. Run `kong migrations up`.
+2. Once that finishes running, both the old and new (1.3) clusters can now run
+   simultaneously on the same datastore. Start provisioning 1.3 nodes, but do
+   not use their Admin API yet. If you need to perform Admin API requests,
+   these should be made to the old cluster's nodes.  The reason is to prevent
+   the new cluster from generating data that is not understood by the old
+   cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 1.3 cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 1.3 cluster, decommission your
+   old nodes.
+5. From your 1.3 cluster, run: `kong migrations finish`.  From this point on,
+   it will not be possible to start nodes in the old cluster pointing to the
+   same datastore anymore. Only run this command when you are confident that
+   your migration was successful. From now on, you can safely make Admin API
+   requests to your 1.3 nodes.
+
+##### Installing 1.3 on a Fresh Datastore
+
+The following commands should be used to prepare a new 1.3 cluster from a fresh
+datastore:
+
+```
+$ kong migrations bootstrap [-c config]
+$ kong start [-c config]
+```
+
+
+
+## Upgrade to `1.2`
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor" and "patch" versions. The upgrade path
+will be different on which previous version from which you are migrating.
+If you are upgrading from 0.x, this is a major upgrade. If you are
+upgrading from 1.0.x or 1.1.x, this is a minor upgrade. Both scenarios are
+explained below.
+
+
+#### 1. Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+are bundled. If you are building your dependencies by hand, you should
+be aware of the following changes:
+
+- The required OpenResty version is 1.13.6.2, but for a full feature set,
+  including stream routing and service mesh abilities with mutual TLS, you need
+  Kong's [openresty-patches](https://github.com/kong/openresty-patches).
+  Note that the set of patches was updated from 1.0 to 1.2.
+- The minimum required OpenSSL version is 1.1.1. If you are building by hand,
+  make sure all dependencies, including LuaRocks modules, are compiled using
+  the same OpenSSL version. If you are installing Kong from one of our
+  distribution packages, you are not affected by this change.
+
+#### 2. Breaking Changes
+
+Kong 1.2 does not include any breaking changes over Kong 1.0 or 1.1, but Kong 1.0
+included a number of breaking changes over Kong 0.x. If you are upgrading
+from 0.14,x, please read the section on
+[Kong 1.0 Breaking Changes](#kong-1-0-breaking-changes) carefully before
+proceeding.
+
+#### 3. Suggested Upgrade Path
+
+##### Upgrade from `0.x` to `1.2`
+
+The lowest version that Kong 1.2 supports migrating from is 0.14.1. if you
+are migrating from a previous 0.x release, please migrate to 0.14.1 first.
+
+For upgrading from 0.14.1 to Kong 1.2, the steps for upgrading are the same as
+upgrading from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the [Suggested Upgrade Path for Kong
+1.0](#kong-1-0-upgrade-path).
+
+##### Upgrade from `1.0.x` or `1.1.x` to `1.2`
+
+Kong 1.2 supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that there is no need to fully copy
+the data, but this also means that they are designed in such a way so that
+the new version of Kong is able to use the data as it is migrated, and to do
+it in a way so that the old Kong cluster keeps working until it is finally
+time to decommission it. For this reason, the full migration is now split into
+two steps, which are performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 1.2).
+
+1. Download 1.2, and configure it to point to the same datastore
+   as your old (1.0 or 1.1) cluster. Run `kong migrations up`.
+2. Once that finishes running, both the old and new (1.2) clusters can now
+   run simultaneously on the same datastore. Start provisioning
+   1.2 nodes, but do not use their Admin API yet. If you need to
+   perform Admin API requests, these should be made to the old cluster's nodes.
+   The reason is to prevent the new cluster from generating data
+   that is not understood by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 1.2 cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 1.2 cluster,
+   decommission your old nodes.
+5. From your 1.2 cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 1.2 nodes.
+
+##### Upgrade Path from 1.2 Release Candidates
+
+The process is the same as for upgrading from 1.0 listed above, but on step 1
+you should run `kong migrations up --force` instead.
+
+##### Installing 1.2 on a Fresh Datastore
+
+The following commands should be used to prepare a new 1.2 cluster from a fresh datastore:
+
+```
+$ kong migrations bootstrap [-c config]
+$ kong start [-c config]
+```
+
+
+## Upgrade to `1.1`
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor" and "patch" versions. The upgrade path
+will be different on which previous version from which you are migrating.
+If you are upgrading from 0.x, this is a major upgrade. If you are
+upgrading from 1.0.x, this is a minor upgrade. Both scenarios are
+explained below.
+
+
+#### 1. Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+are bundled. If you are building your dependencies by hand, you should
+be aware of the following changes:
+
+- The required OpenResty version is 1.13.6.2, but for a full feature set,
+  including stream routing and service mesh abilities with mutual TLS, you need
+  Kong's [openresty-patches](https://github.com/kong/openresty-patches).
+  Note that the set of patches was updated from 1.0 to 1.1.
+- The minimum required OpenSSL version is 1.1.1. If you are building by hand,
+  make sure all dependencies, including LuaRocks modules, are compiled using
+  the same OpenSSL version. If you are installing Kong from one of our
+  distribution packages, you are not affected by this change.
+
+#### 2. Breaking Changes
+
+Kong 1.1 does not include any breaking changes over Kong 1.0, but Kong 1.0
+included a number of breaking changes over Kong 0.x. If you are upgrading
+from 0.14,x, please read the section on
+[Kong 1.0 Breaking Changes](#kong-1-0-breaking-changes) carefully before
+proceeding.
+
+#### 3. Suggested Upgrade Path
+
+##### Upgrade from `0.x` to `1.1`
+
+The lowest version that Kong 1.1 supports migrating from is 0.14.1. if you
+are migrating from a previous 0.x release, please migrate to 0.14.1 first.
+
+For upgrading from 0.14.1 to Kong 1.1, the steps for upgrading are the same as
+upgrading from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the [Suggested Upgrade Path for Kong
+1.0](#kong-1-0-upgrade-path).
+
+##### Upgrade from `1.0.x` to `1.1`
+
+Kong 1.1 supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that there is no need to fully copy
+the data, but this also means that they are designed in such a way so that
+the new version of Kong is able to use the data as it is migrated, and to do
+it in a way so that the old Kong cluster keeps working until it is finally
+time to decommission it. For this reason, the full migration is now split into
+two steps, which are performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 1.1).
+
+1. Download 1.1, and configure it to point to the same datastore
+   as your 1.0 cluster. Run `kong migrations up`.
+2. Once that finishes running, both 1.0 and 1.1 clusters can now
+   run simultaneously on the same datastore. Start provisioning
+   1.1 nodes, but do not use their Admin API yet. If you need to
+   perform Admin API requests, these should be made to your 1.0 nodes.
+   The reason is to prevent the new cluster from generating data
+   that is not understood by the old cluster.
+3. Gradually divert traffic away from your 1.0 nodes, and into
+   your 1.1 cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 1.1 cluster,
+   decommission your 1.0 nodes.
+5. From your 1.1 cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start 1.0
+   nodes pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 1.1 nodes.
+
+##### Upgrade Path from 1.1 Release Candidates
+
+The process is the same as for upgrading from 1.0 listed above, but on step 1
+you should run `kong migrations up --force` instead.
+
+##### Installing 1.1 on a Fresh Datastore
+
+The following commands should be used to prepare a new 1.1 cluster from a fresh datastore:
+
+```
+$ kong migrations bootstrap [-c config]
+$ kong start [-c config]
+```
+
+
+## Upgrading `1.0.x` patch releases
 
 If you are upgrading from another release in the 1.0.x series (e.g. from 1.0.0
 to 1.0.1), there are no migrations. Simply upgrade your Kong installation and
@@ -49,7 +1144,7 @@ $ kong reload [-c configuration_file]
 If you are upgrading from 0.x, then read the following section for
 detailed migration instructions.
 
-### Upgrade from `0.x` to `1.0.x`
+## Upgrade from `0.x` to `1.0.x`
 
 Kong 1.0 is a major upgrade, and includes a number of new features
 as well as breaking changes.
@@ -67,7 +1162,8 @@ that you consult the full [1.0.0
 Changelog](https://github.com/Kong/kong/blob/master/CHANGELOG.md) for a
 complete list of changes and new features.
 
-### 1. Breaking Changes
+<a name="kong-1-0-breaking-changes"></a>
+#### 1. Breaking Changes
 
 ##### Dependencies
 
@@ -200,7 +1296,7 @@ plugins is now removed.
 - With the removal of the API entity, the `/apis` endpoint
   is removed; accordingly, other endpoints that accepted
   `api_id` no longer do so. Use Routes and Services instead.
-- All entity endpoints now use the new Admin API implementaion.
+- All entity endpoints now use the new Admin API implementation.
   This means their requests and responses now use the same
   syntax, which was already in use in endpoints such as
   `/routes` and `/services`.
@@ -229,6 +1325,7 @@ plugins is now removed.
 
 There are no deprecation notices in this release.
 
+<a name="kong-1-0-upgrade-path"></a>
 #### 3. Suggested Upgrade Path
 
 ##### Preliminary Checks
@@ -256,19 +1353,32 @@ See the section above on Plugins for information on plugin compatibility.
 
 Kong 1.0 introduces a new, improved migrations framework.
 It supports a no-downtime, Blue/Green migration model for upgrading
-from 0.14.x. The full migration is now split into two steps,
-which are performed via commands `kong migrations up` and
-`kong migrations finish`.
+from 0.14.x. This means that while the migration is ongoing, you will
+have two Kong clusters running, sharing the same database. The "Blue" cluster
+is your existing cluster running 0.14.x, the "Green" cluster is the new one
+running Kong 1.0.
+
+The migrations are designed so that there is no need to fully copy
+the data, but this also means that they are designed in such a way so that
+the new version of Kong is able to use the data as it is migrated, and to do
+it in a way so that the old Kong cluster keeps working until it is finally
+time to decommission it. For this reason, the full migration is now split into
+two steps, which are performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 1.0).
 
 For a no-downtime migration from a 0.14 cluster to a 1.0 cluster,
 we recommend the following sequence of steps:
 
 1. Download 1.0, and configure it to point to the same datastore
-   as your 0.14 cluster. Run `kong migrations up`.
-2. Both 0.14 and 1.0 nodes can now run simultaneously on the same
-   datastore. Start provisioning 1.0 nodes, but do not use their
-   Admin API yet. Prefer making Admin API requests to your 0.14 nodes
-   instead.
+   as your 0.14 cluster. Run `kong migrations up` from a Kong 1.0
+   node.
+2. Once that finishes running, both 0.14 and 1.0 clusters can now
+   run simultaneously on the same datastore. Start provisioning
+   1.0 nodes, but do not use their Admin API yet. If you need to
+   perform Admin API requests, these should be made to your 0.14 nodes.
+   The reason is to prevent the new cluster from generating data
+   that is not understood by the old cluster.
 3. Gradually divert traffic away from your 0.14 nodes, and into
    your 1.0 cluster. Monitor your traffic to make sure everything
    is going smoothly.
@@ -295,7 +1405,7 @@ $ kong start [-c config]
 ```
 
 
-### Upgrade to `0.15`
+## Upgrade to `0.15`
 
 This is the last release in the 0.x series, giving users one last chance to
 upgrade while still using some of the options and concepts that were marked as
@@ -313,7 +1423,7 @@ that you consult the full [0.15
 Changelog](https://github.com/Kong/kong/blob/master/CHANGELOG.md) for a
 complete list of changes and new features.
 
-### 1. Breaking Changes
+#### 1. Breaking Changes
 
 ##### Dependencies
 
@@ -425,7 +1535,7 @@ functionality which was possibly used by custom plugins is now removed.
 
 ##### Admin API
 
-- All entity endpoints now use the new Admin API implementaion.
+- All entity endpoints now use the new Admin API implementation.
   This means their requests and responses now use the same
   syntax, which was already in use in endpoints such as
   `/routes` and `/services`.
@@ -543,6 +1653,14 @@ complete list of changes and new features.
 - The Nginx configuration file has changed, which means that you need to update
   it if you are using a custom template. The changes are detailed in a diff
   included below.
+
+##### Plugins
+- The Runscope plugin has been dropped, based on the EoL announcement made by Runscope about their Traffic Inspector product. [#3495](https://github.com/Kong/kong/pull/3495)
+
+##### Admin API
+- The SSL Certificates and SNI entities have moved to the new DAO implementation. As such, the /certificates and /snis endpoints have received notable usability improvements, but suffer from a few breaking changes. [#3386](https://github.com/Kong/kong/pull/3386)
+
+- The Consumers entity has moved to the new DAO implementation. As such, the `/consumers` endpoint has received notable usability improvements, but suffers from a few breaking changes. [#3437](https://github.com/Kong/kong/pull/3437)
 
 <details>
 <summary><strong>Click here to see the Nginx configuration changes</strong></summary>

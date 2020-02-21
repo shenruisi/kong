@@ -21,15 +21,20 @@ local phase_checker = require "kong.pdk.private.phases"
 local ngx = ngx
 local fmt = string.format
 local type = type
+local find = string.find
+local lower = string.lower
 local error = error
 local pairs = pairs
-local insert = table.insert
 local coroutine = coroutine
 local normalize_header = checks.normalize_header
 local normalize_multi_header = checks.normalize_multi_header
 local validate_header = checks.validate_header
 local validate_headers = checks.validate_headers
 local check_phase = phase_checker.check
+local add_header
+if ngx and ngx.config.subsystem == "http" then
+  add_header = require("ngx.resp").add_header
+end
 
 
 local PHASES = phase_checker.phases
@@ -38,15 +43,13 @@ local PHASES = phase_checker.phases
 local header_body_log = phase_checker.new(PHASES.header_filter,
                                           PHASES.body_filter,
                                           PHASES.log,
+                                          PHASES.error,
                                           PHASES.admin_api)
-
-local rewrite_access = phase_checker.new(PHASES.rewrite,
-                                         PHASES.access,
-                                         PHASES.admin_api)
 
 local rewrite_access_header = phase_checker.new(PHASES.rewrite,
                                                 PHASES.access,
                                                 PHASES.header_filter,
+                                                PHASES.error,
                                                 PHASES.admin_api)
 
 
@@ -63,9 +66,49 @@ local function new(self, major_version)
   local SERVER_HEADER_NAME   = "Server"
   local SERVER_HEADER_VALUE  = meta._NAME .. "/" .. meta._VERSION
 
+  local GRPC_STATUS_UNKNOWN  = 2
+  local GRPC_STATUS_NAME     = "grpc-status"
+  local GRPC_MESSAGE_NAME    = "grpc-message"
+
   local CONTENT_LENGTH_NAME  = "Content-Length"
   local CONTENT_TYPE_NAME    = "Content-Type"
   local CONTENT_TYPE_JSON    = "application/json; charset=utf-8"
+  local CONTENT_TYPE_GRPC    = "application/grpc"
+
+  local HTTP_TO_GRPC_STATUS = {
+    [200] = 0,
+    [400] = 3,
+    [401] = 16,
+    [403] = 7,
+    [404] = 5,
+    [409] = 6,
+    [429] = 8,
+    [499] = 1,
+    [500] = 13,
+    [501] = 12,
+    [503] = 14,
+    [504] = 4,
+  }
+
+  local GRPC_MESSAGES = {
+    [0]  = "OK",
+    [1]  = "Canceled",
+    [2]  = "Unknown",
+    [3]  = "InvalidArgument",
+    [4]  = "DeadlineExceeded",
+    [5]  = "NotFound",
+    [6]  = "AlreadyExists",
+    [7]  = "PermissionDenied",
+    [8]  = "ResourceExhausted",
+    [9]  = "FailedPrecondition",
+    [10] = "Aborted",
+    [11] = "OutOfRange",
+    [12] = "Unimplemented",
+    [13] = "Internal",
+    [14] = "Unavailable",
+    [15] = "DataLoss",
+    [16] = "Unauthenticated",
+  }
 
 
   ---
@@ -331,6 +374,9 @@ local function new(self, major_version)
   -- kong.response.add_header("Cache-Control", "no-cache")
   -- kong.response.add_header("Cache-Control", "no-store")
   function _RESPONSE.add_header(name, value)
+    -- stream subsystem would been stopped by the phase checker below
+    -- therefore the nil reference to add_header will never have chance
+    -- to show
     check_phase(rewrite_access_header)
 
     if ngx.headers_sent then
@@ -339,14 +385,7 @@ local function new(self, major_version)
 
     validate_header(name, value)
 
-    local new_value = _RESPONSE.get_headers()[name]
-    if type(new_value) ~= "table" then
-      new_value = { new_value }
-    end
-
-    insert(new_value, normalize_header(value))
-
-    ngx.header[name] = new_value
+    add_header(name, normalize_header(value))
   end
 
 
@@ -445,38 +484,143 @@ local function new(self, major_version)
       error("headers have already been sent", 2)
     end
 
-    local json
-    if type(body) == "table" then
-      local err
-      json, err = cjson.encode(body)
-      if err then
-        return nil, err
-      end
-    end
-
     ngx.status = status
 
-    if self.ctx.core.phase == phase_checker.phases.admin_api then
+    if self.ctx.core.phase == phase_checker.phases.error or
+       self.ctx.core.phase == phase_checker.phases.admin_api
+    then
       ngx.header[SERVER_HEADER_NAME] = SERVER_HEADER_VALUE
     end
 
+    local has_content_type
     if headers ~= nil then
       for name, value in pairs(headers) do
         ngx.header[name] = normalize_multi_header(value)
+        if not has_content_type then
+          local lower_name = lower(name)
+          if lower_name == "content-type" or
+             lower_name == "content_type" then
+            has_content_type = true
+          end
+        end
       end
     end
 
+    local res_ctype = ngx.header[CONTENT_TYPE_NAME]
+    local req_ctype = ngx.var.content_type
+
+    local is_grpc
+    local is_grpc_output
+    if res_ctype then
+      is_grpc = find(res_ctype, CONTENT_TYPE_GRPC, 1, true) == 1
+      is_grpc_output = is_grpc
+    elseif req_ctype then
+      is_grpc = find(req_ctype, CONTENT_TYPE_GRPC, 1, true) == 1
+                 and ngx.req.http_version() == 2
+    end
+
+    local grpc_status
+    if is_grpc and not ngx.header[GRPC_STATUS_NAME] then
+      grpc_status = HTTP_TO_GRPC_STATUS[status]
+      if not grpc_status then
+        if status >= 500 and status <= 599 then
+          grpc_status = HTTP_TO_GRPC_STATUS[500]
+        elseif status >= 400 and status <= 499 then
+          grpc_status = HTTP_TO_GRPC_STATUS[400]
+        elseif status >= 200 and status <= 299 then
+          grpc_status = HTTP_TO_GRPC_STATUS[200]
+        else
+          grpc_status = GRPC_STATUS_UNKNOWN
+        end
+      end
+
+      ngx.header[GRPC_STATUS_NAME] = grpc_status
+    end
+
+    local json
+    if type(body) == "table" then
+      if is_grpc then
+        if is_grpc_output then
+          error("table body encoding with gRPC is not supported", 2)
+
+        elseif type(body.message) == "string" then
+          body = body.message
+
+        else
+          self.log.warn("body was removed because table body encoding with " ..
+                        "gRPC is not supported")
+          body = nil
+        end
+
+      else
+        local err
+        json, err = cjson.encode(body)
+        if err then
+          return nil, err
+        end
+      end
+    end
+
+    local is_header_filter_phase = self.ctx.core.phase == PHASES.header_filter
+
     if json ~= nil then
-      ngx.header[CONTENT_TYPE_NAME]   = CONTENT_TYPE_JSON
+      if not has_content_type then
+        ngx.header[CONTENT_TYPE_NAME] = CONTENT_TYPE_JSON
+      end
+
       ngx.header[CONTENT_LENGTH_NAME] = #json
-      ngx.print(json)
+
+      if is_header_filter_phase then
+        self.ctx.core.response_body = json
+
+      else
+        ngx.print(json)
+      end
 
     elseif body ~= nil then
-      ngx.header[CONTENT_LENGTH_NAME] = #body
-      ngx.print(body)
+      if is_grpc and not is_grpc_output then
+        ngx.header[CONTENT_LENGTH_NAME] = 0
+        ngx.header[GRPC_MESSAGE_NAME] = body
+
+        if is_header_filter_phase then
+          self.ctx.core.response_body = ""
+
+        else
+          ngx.print() -- avoid default content
+        end
+
+      else
+        ngx.header[CONTENT_LENGTH_NAME] = #body
+        if grpc_status and not ngx.header[GRPC_MESSAGE_NAME] then
+          ngx.header[GRPC_MESSAGE_NAME] = GRPC_MESSAGES[grpc_status]
+        end
+
+        if is_header_filter_phase then
+          self.ctx.core.response_body = body
+
+        else
+          ngx.print(body)
+        end
+      end
 
     else
       ngx.header[CONTENT_LENGTH_NAME] = 0
+      if grpc_status and not ngx.header[GRPC_MESSAGE_NAME] then
+        ngx.header[GRPC_MESSAGE_NAME] = GRPC_MESSAGES[grpc_status]
+      end
+
+      if is_grpc then
+        if is_header_filter_phase then
+          self.ctx.core.response_body = ""
+
+        else
+          ngx.print() -- avoid default content
+        end
+      end
+    end
+
+    if is_header_filter_phase then
+      return ngx.exit(ngx.OK)
     end
 
     return ngx.exit(status)
@@ -520,7 +664,12 @@ local function new(self, major_version)
   -- as-is.  It is the caller's responsibility to set the appropriate
   -- Content-Type header via the third argument.  As a convenience, `body` can
   -- be specified as a table; in which case, it will be JSON-encoded and the
-  -- `application/json` Content-Type header will be set.
+  -- `application/json` Content-Type header will be set. On gRPC we cannot send
+  -- the `body` with this function at the moment at least, so what it does
+  -- instead is that it sends "body" in `grpc-message` header instead. If the
+  -- body is a table it looks for a field `message` in it, and uses that as a
+  -- `grpc-message` header. Though, if you have specified `Content-Type` header
+  -- starting with `application/grpc`, the body will be sent.
   --
   -- The third, optional, `headers` argument can be a table specifying response
   -- headers to send. If specified, its behavior is similar to
@@ -553,10 +702,12 @@ local function new(self, major_version)
   --   ["WWW-Authenticate"] = "Basic"
   -- })
   function _RESPONSE.exit(status, body, headers)
-    if body == nil then
+    local is_buffered_exit = self.ctx.core.buffered_proxying
+                         and self.ctx.core.phase == PHASES.balancer
+                         and ngx.get_phase()     == "access"
+
+    if not is_buffered_exit then
       check_phase(rewrite_access_header)
-    else
-      check_phase(rewrite_access)
     end
 
     if ngx.headers_sent then
@@ -583,7 +734,16 @@ local function new(self, major_version)
     end
 
     local ctx = ngx.ctx
-    ctx.KONG_EXITED = true
+
+    if is_buffered_exit then
+      self.ctx.core.buffered_status = status
+      self.ctx.core.buffered_headers = headers
+      self.ctx.core.buffered_body = body
+
+    else
+      ctx.KONG_EXITED = true
+    end
+
     if ctx.delay_response and not ctx.delayed_response then
       ctx.delayed_response = {
         status_code = status,

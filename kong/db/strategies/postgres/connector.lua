@@ -2,6 +2,7 @@ local logger       = require "kong.cmd.utils.log"
 local pgmoon       = require "pgmoon"
 local arrays       = require "pgmoon.arrays"
 local stringx      = require "pl.stringx"
+local semaphore    = require "ngx.semaphore"
 
 
 local setmetatable = setmetatable
@@ -27,6 +28,7 @@ local sub          = string.sub
 
 
 local WARN                          = ngx.WARN
+local ERR                           = ngx.ERR
 local SQL_INFORMATION_SCHEMA_TABLES = [[
 SELECT table_name
   FROM information_schema.tables
@@ -118,15 +120,67 @@ local function iterator(rows)
 end
 
 
+local function get_table_names(self, excluded)
+  local i = 0
+  local table_names = {}
+  for row, err in self:iterate(SQL_INFORMATION_SCHEMA_TABLES) do
+    if err then
+      return nil, err
+    end
+
+    if not excluded or not excluded[row.table_name] then
+      i = i + 1
+      table_names[i] = self:escape_identifier(row.table_name)
+    end
+  end
+
+  return table_names
+end
+
+
+local function reset_schema(self)
+  local table_names, err = get_table_names(self)
+  if not table_names then
+    return nil, err
+  end
+
+  local drop_tables
+  if #table_names == 0 then
+    drop_tables = ""
+  else
+    drop_tables = concat {
+      "    DROP TABLE IF EXISTS ", concat(table_names, ", "), " CASCADE;\n"
+    }
+  end
+
+  local schema = self:escape_identifier(self.config.schema)
+  local ok, err = self:query(concat {
+    "BEGIN;\n",
+    "  DO $$\n",
+    "  BEGIN\n",
+    "    DROP SCHEMA IF EXISTS ", schema, " CASCADE;\n",
+    "    CREATE SCHEMA IF NOT EXISTS ", schema, " AUTHORIZATION CURRENT_USER;\n",
+    "    GRANT ALL ON SCHEMA ", schema ," TO CURRENT_USER;\n",
+    "  EXCEPTION WHEN insufficient_privilege THEN\n", drop_tables,
+    "  END;\n",
+    "  $$;\n",
+    "    SET SCHEMA ",  self:escape_literal(self.config.schema), ";\n",
+    "COMMIT;",  })
+
+  if not ok then
+    return nil, err
+  end
+
+  return true
+end
+
+
 local setkeepalive
 
 
 local function connect(config)
   local phase  = get_phase()
-  -- TODO: remove preread from here when the issue with starttls has been fixed
-  -- TODO: make also sure that Cassandra doesn't use LuaSockets on preread after
-  --       starttls has been fixed
-  if phase == "preread" or phase == "init" or phase == "init_worker" or ngx.IS_CLI then
+  if phase == "init" or phase == "init_worker" or ngx.IS_CLI then
     -- Force LuaSocket usage in the CLI in order to allow for self-signed
     -- certificates to be trusted (via opts.cafile) in the resty-cli
     -- interpreter (no way to set lua_ssl_trusted_certificate).
@@ -196,7 +250,9 @@ setkeepalive = function(connection)
 end
 
 
-local _mt = {}
+local _mt = {
+  reset = reset_schema
+}
 
 
 _mt.__index = _mt
@@ -214,7 +270,7 @@ function _mt:init()
   local res, err = self:query("SHOW server_version_num;")
   local ver = tonumber(res and res[1] and res[1].server_version_num)
   if not ver then
-    return nil, "failed to retrieve server_version_num: " .. err
+    return nil, "failed to retrieve PostgreSQL server_version_num: " .. err
   end
 
   local major = floor(ver / 10000)
@@ -233,17 +289,13 @@ end
 
 function _mt:init_worker(strategies)
   if ngx.worker.id() == 0 then
-    local graph
-    local found = false
+    local graph = tsort.new()
+
+    graph:add("cluster_events")
 
     for _, strategy in pairs(strategies) do
       local schema = strategy.schema
       if schema.ttl then
-        if not found then
-          graph = tsort.new()
-          found = true
-        end
-
         local name = schema.name
         graph:add(name)
         for _, field in schema:each_field() do
@@ -254,40 +306,51 @@ function _mt:init_worker(strategies)
       end
     end
 
-    if not found then
-      return true
-    end
-
     local sorted_strategies = graph:sort()
     local ttl_escaped = self:escape_identifier("ttl")
-    local cleanup_statement = {}
-    for i, table_name in ipairs(sorted_strategies) do
-      cleanup_statement[i] = concat {
+    local expire_at_escaped = self:escape_identifier("expire_at")
+    local cleanup_statements = {}
+    local cleanup_statements_count = #sorted_strategies
+    for i = 1, cleanup_statements_count do
+      local table_name = sorted_strategies[i]
+      local column_name = table_name == "cluster_events" and expire_at_escaped
+                                                          or ttl_escaped
+      cleanup_statements[i] = concat {
         "  DELETE FROM ",
         self:escape_identifier(table_name),
         " WHERE ",
-        ttl_escaped,
+        column_name,
         " < CURRENT_TIMESTAMP AT TIME ZONE 'UTC';"
       }
     end
 
-    cleanup_statement = concat({
-      "BEGIN;",
-      concat(cleanup_statement, "\n"),
-      "COMMIT;"
-    }, "\n")
+    local cleanup_statement = concat(cleanup_statements, "\n")
 
     return timer_every(60, function(premature)
       if premature then
         return
       end
 
-      local ok, err = self:query(cleanup_statement)
+      local ok, err, _, num_queries = self:query(cleanup_statement)
       if not ok then
-        if err then
-          log(WARN, "unable to clean expired rows from postgres database (", err, ")")
+        if num_queries then
+          for i = num_queries + 1, cleanup_statements_count do
+            local statement = cleanup_statements[i]
+            local ok, err = self:query(statement)
+            if not ok then
+              if err then
+                log(WARN, "unable to clean expired rows from table '",
+                          sorted_strategies[i], "' on PostgreSQL database (",
+                          err, ")")
+              else
+                log(WARN, "unable to clean expired rows from table '",
+                          sorted_strategies[i], "' on PostgreSQL database")
+              end
+            end
+          end
+
         else
-          log(WARN, "unable to clean expired rows from postgres database")
+          log(ERR, "unable to clean expired rows from PostgreSQL database (", err, ")")
         end
       end
     end)
@@ -304,10 +367,11 @@ function _mt:infos()
   end
 
   return {
-    strategy = "PostgreSQL",
-    db_name  = self.config.database,
-    db_desc  = "database",
-    db_ver   = db_ver or "unknown",
+    strategy  = "PostgreSQL",
+    db_name   = self.config.database,
+    db_schema = self.config.schema,
+    db_desc   = "database",
+    db_ver    = db_ver or "unknown",
   }
 end
 
@@ -370,8 +434,51 @@ function _mt:setkeepalive()
 end
 
 
+function _mt:acquire_query_semaphore_resource()
+  if not self.sem then
+    return true
+  end
+
+  do
+    local phase = get_phase()
+    if phase == "init" or phase == "init_worker" then
+      return true
+    end
+  end
+
+  local ok, err = self.sem:wait(self.config.sem_timeout)
+  if not ok then
+    return nil, err
+  end
+
+  return true
+end
+
+
+function _mt:release_query_semaphore_resource()
+  if not self.sem then
+    return true
+  end
+
+  do
+    local phase = get_phase()
+    if phase == "init" or phase == "init_worker" then
+      return true
+    end
+  end
+
+  self.sem:post()
+end
+
+
 function _mt:query(sql)
   local res, err, partial, num_queries
+
+  local ok
+  ok, err = self:acquire_query_semaphore_resource()
+  if not ok then
+    return nil, "error acquiring query semaphore: " .. err
+  end
 
   local conn = self:get_stored_connection()
   if conn then
@@ -381,6 +488,7 @@ function _mt:query(sql)
     local connection
     connection, err = connect(self.config)
     if not connection then
+      self:release_query_semaphore_resource()
       return nil, err
     end
 
@@ -388,6 +496,8 @@ function _mt:query(sql)
 
     setkeepalive(connection)
   end
+
+  self:release_query_semaphore_resource()
 
   if res then
     return res, nil, partial, num_queries or err
@@ -419,38 +529,13 @@ function _mt:iterate(sql)
 end
 
 
-function _mt:reset()
-  local schema = self:escape_identifier(self.config.schema)
-  local user = self:escape_identifier(self.config.user)
-
-  local ok, err = self:query(concat {
-    "BEGIN;\n",
-    "  DROP SCHEMA IF EXISTS ", schema ," CASCADE;\n",
-    "  CREATE SCHEMA IF NOT EXISTS ", schema, " AUTHORIZATION ", user, ";\n",
-    "  GRANT ALL ON SCHEMA ", schema ," TO ", user, ";\n",
-    "COMMIT;",
-  })
-
-  if not ok then
+function _mt:truncate()
+  local table_names, err = get_table_names(self, PROTECTED_TABLES)
+  if not table_names then
     return nil, err
   end
 
-  return true
-end
-
-
-function _mt:truncate()
-  local i, table_names = 0, {}
-
-  for row in self:iterate(SQL_INFORMATION_SCHEMA_TABLES) do
-    local table_name = row.table_name
-    if not PROTECTED_TABLES[table_name] then
-      i = i + 1
-      table_names[i] = self:escape_identifier(table_name)
-    end
-  end
-
-  if i == 0 then
+  if #table_names == 0 then
     return true
   end
 
@@ -482,7 +567,7 @@ end
 
 
 function _mt:setup_locks(_, _)
-  logger.verbose("creating 'locks' table if not existing...")
+  logger.debug("creating 'locks' table if not existing...")
 
   local ok, err = self:query([[
 BEGIN;
@@ -498,7 +583,7 @@ COMMIT;]])
     return nil, err
   end
 
-  logger.verbose("successfully created 'locks' table")
+  logger.debug("successfully created 'locks' table")
 
   return true
 end
@@ -559,9 +644,10 @@ end
 
 function _mt:remove_lock(key, owner)
   local sql = concat {
-    "DELETE FROM locks\n",
-    "      WHERE key   = ", self:escape_literal(key), "\n",
-         "   AND owner = ", self:escape_literal(owner), ";"
+    "DELETE\n",
+    "  FROM ", self:escape_identifier("locks"), "\n",
+    " WHERE ", self:escape_identifier("key"), "   = ", self:escape_literal(key), "\n",
+    "   AND ", self:escape_identifier("owner"), " = ", self:escape_literal(owner), ";"
   }
 
   local res, err = self:query(sql)
@@ -579,16 +665,21 @@ function _mt:schema_migrations()
     error("no connection")
   end
 
-  local has_schema_meta_table
-  for row in self:iterate(SQL_INFORMATION_SCHEMA_TABLES) do
-    local table_name = row.table_name
-    if table_name == "schema_meta" then
-      has_schema_meta_table = true
+  local table_names, err = get_table_names(self)
+  if not table_names then
+    return nil, err
+  end
+
+  local schema_meta_table_name = self:escape_identifier("schema_meta")
+  local schema_meta_table_exists
+  for _, table_name in ipairs(table_names) do
+    if table_name == schema_meta_table_name then
+      schema_meta_table_exists = true
       break
     end
   end
 
-  if not has_schema_meta_table then
+  if not schema_meta_table_exists then
     -- database, but no schema_meta: needs bootstrap
     return nil
   end
@@ -621,9 +712,34 @@ function _mt:schema_bootstrap(kong_config, default_locks_ttl)
     error("no connection")
   end
 
+  -- create schema if not exists
+
+  logger.debug("creating '%s' schema if not existing...", self.config.schema)
+
+  local schema = self:escape_identifier(self.config.schema)
+  local ok, err = self:query(concat {
+    "BEGIN;\n",
+    "  DO $$\n",
+    "  BEGIN\n",
+    "    CREATE SCHEMA IF NOT EXISTS ", schema, " AUTHORIZATION CURRENT_USER;\n",
+    "    GRANT ALL ON SCHEMA ", schema ," TO CURRENT_USER;\n",
+    "  EXCEPTION WHEN insufficient_privilege THEN\n",
+    "    -- Do nothing, perhaps the schema has been created already\n",
+    "  END;\n",
+    "  $$;\n",
+    "  SET SCHEMA ",  self:escape_literal(self.config.schema), ";\n",
+    "COMMIT;",
+  })
+
+  if not ok then
+    return nil, err
+  end
+
+  logger.debug("successfully created '%s' schema", self.config.schema)
+
   -- create schema meta table if not exists
 
-  logger.verbose("creating 'schema_meta' table if not existing...")
+  logger.debug("creating 'schema_meta' table if not existing...")
 
   local res, err = self:query([[
     CREATE TABLE IF NOT EXISTS schema_meta (
@@ -640,7 +756,7 @@ function _mt:schema_bootstrap(kong_config, default_locks_ttl)
     return nil, err
   end
 
-  logger.verbose("successfully created 'schema_meta' table")
+  logger.debug("successfully created 'schema_meta' table")
 
   local ok
   ok, err = self:setup_locks(default_locks_ttl, true)
@@ -658,23 +774,9 @@ function _mt:schema_reset()
     error("no connection")
   end
 
-  local schema = self:escape_identifier(self.config.schema)
-  local user = self:escape_identifier(self.config.user)
-
-  local ok, err = self:query(concat {
-    "BEGIN;\n",
-    "  DROP SCHEMA IF EXISTS ", schema, " CASCADE;\n",
-    "  CREATE SCHEMA IF NOT EXISTS ", schema, " AUTHORIZATION ", user, ";\n",
-    "  GRANT ALL ON SCHEMA ", schema ," TO ", user, ";\n",
-    "COMMIT;",
-  })
-
-  if not ok then
-    return nil, err
-  end
-
-  return true
+  return reset_schema(self)
 end
+
 
 function _mt:run_up_migration(name, up_sql)
   if type(name) ~= "string" then
@@ -771,225 +873,42 @@ function _mt:record_migration(subsystem, name, state)
 end
 
 
-function _mt:are_014_apis_present()
-  local _, err = self:query([[
-    DO $$
-    BEGIN
-      IF EXISTS(SELECT id FROM apis) THEN
-        RAISE EXCEPTION 'there are apis in the db';
-      END IF;
-    EXCEPTION WHEN UNDEFINED_TABLE THEN
-      -- Do nothing, table does not exist
-    END;
-    $$;
-  ]])
-  if err and err:match("there are apis in the db") then
-    return true
-  end
-  if err then
-    return nil, err
-  end
-  return false
-end
-
-
-function _mt:is_014()
-  local res = {}
-
-  local needed_migrations = {
-    ["core"] = {
-      "2015-01-12-175310_skeleton",
-      "2015-01-12-175310_init_schema",
-      "2015-11-23-817313_nodes",
-      "2016-02-29-142793_ttls",
-      "2016-09-05-212515_retries",
-      "2016-09-16-141423_upstreams",
-      "2016-12-14-172100_move_ssl_certs_to_core",
-      "2016-11-11-151900_new_apis_router_1",
-      "2016-11-11-151900_new_apis_router_2",
-      "2016-11-11-151900_new_apis_router_3",
-      "2016-01-25-103600_unique_custom_id",
-      "2017-01-24-132600_upstream_timeouts",
-      "2017-01-24-132600_upstream_timeouts_2",
-      "2017-03-27-132300_anonymous",
-      "2017-04-18-153000_unique_plugins_id",
-      "2017-04-18-153000_unique_plugins_id_2",
-      "2017-05-19-180200_cluster_events",
-      "2017-05-19-173100_remove_nodes_table",
-      "2017-06-16-283123_ttl_indexes",
-      "2017-07-28-225000_balancer_orderlist_remove",
-      "2017-10-02-173400_apis_created_at_ms_precision",
-      "2017-11-07-192000_upstream_healthchecks",
-      "2017-10-27-134100_consistent_hashing_1",
-      "2017-11-07-192100_upstream_healthchecks_2",
-      "2017-10-27-134100_consistent_hashing_2",
-      "2017-09-14-121200_routes_and_services",
-      "2017-10-25-180700_plugins_routes_and_services",
-      "2018-03-27-123400_prepare_certs_and_snis",
-      "2018-03-27-125400_fill_in_snis_ids",
-      "2018-03-27-130400_make_ids_primary_keys_in_snis",
-      "2018-05-17-173100_hash_on_cookie",
-    },
-    ["response-transformer"] = {
-      "2016-05-04-160000_resp_trans_schema_changes",
-    },
-    ["jwt"] = {
-      "2015-06-09-jwt-auth",
-      "2016-03-07-jwt-alg",
-      "2017-05-22-jwt_secret_not_unique",
-      "2017-07-31-120200_jwt-auth_preflight_default",
-      "2017-10-25-211200_jwt_cookie_names_default",
-      "2018-03-15-150000_jwt_maximum_expiration",
-    },
-    ["ip-restriction"] = {
-      "2016-05-24-remove-cache",
-    },
-    ["statsd"] = {
-      "2017-06-09-160000_statsd_schema_changes",
-    },
-    ["cors"] = {
-      "2017-03-14_multiple_orgins",
-    },
-    ["basic-auth"] = {
-      "2015-08-03-132400_init_basicauth",
-      "2017-01-25-180400_unique_username",
-    },
-    ["key-auth"] = {
-      "2015-07-31-172400_init_keyauth",
-      "2017-07-31-120200_key-auth_preflight_default",
-    },
-    ["ldap-auth"] = {
-      "2017-10-23-150900_header_type_default",
-    },
-    ["hmac-auth"] = {
-      "2015-09-16-132400_init_hmacauth",
-      "2017-06-21-132400_init_hmacauth",
-    },
-    ["datadog"] = {
-      "2017-06-09-160000_datadog_schema_changes",
-    },
-    ["tcp-log"] = {
-      "2017-12-13-120000_tcp-log_tls",
-    },
-    ["acl"] = {
-      "2015-08-25-841841_init_acl",
-    },
-    ["response-ratelimiting"] = {
-      "2015-08-03-132400_init_response_ratelimiting",
-      "2016-08-04-321512_response-rate-limiting_policies",
-      "2017-12-19-120000_add_route_and_service_id_to_response_ratelimiting",
-    },
-    ["request-transformer"] = {
-      "2016-05-04-160000_req_trans_schema_changes",
-    },
-    ["rate-limiting"] = {
-      "2015-08-03-132400_init_ratelimiting",
-      "2016-07-25-471385_ratelimiting_policies",
-      "2017-11-30-120000_add_route_and_service_id",
-    },
-    ["oauth2"] = {
-      "2015-08-03-132400_init_oauth2",
-      "2016-07-15-oauth2_code_credential_id",
-      "2016-12-22-283949_serialize_redirect_uri",
-      "2016-09-19-oauth2_api_id",
-      "2016-12-15-set_global_credentials",
-      "2017-04-24-oauth2_client_secret_not_unique",
-      "2017-10-19-set_auth_header_name_default",
-      "2017-10-11-oauth2_new_refresh_token_ttl_config_value",
-      "2018-01-09-oauth2_pg_add_service_id",
-    },
-  }
-
-  local rows, err = self:query([[
-    SELECT to_regclass('schema_migrations') AS "name";
-  ]])
-  if err then
-    return nil, err
-  end
-
-  if not rows or not rows[1] or rows[1].name ~= "schema_migrations" then
-    -- no trace of legacy migrations: above 0.14
-    return res
-  end
-
-  local schema_migrations_rows, err = self:query([[
-    SELECT "id", "migrations" FROM "schema_migrations";
-  ]])
-  if err then
-    return nil, err
-  end
-
-  if not schema_migrations_rows then
-    -- empty legacy migrations: invalid state
-    res.invalid_state = true
-    return res
-  end
-
-  local schema_migrations = {}
-  for i = 1, #schema_migrations_rows do
-    local row = schema_migrations_rows[i]
-    schema_migrations[row.id] = row.migrations
-  end
-
-  for name, migrations in pairs(needed_migrations) do
-    local current_migrations = schema_migrations[name]
-    if not current_migrations then
-      -- missing all migrations for a component: below 0.14
-      res.invalid_state = true
-      res.missing_component = name
-      return res
-    end
-
-    for _, needed_migration in ipairs(migrations) do
-      local found
-
-      for _, current_migration in ipairs(current_migrations) do
-        if current_migration == needed_migration then
-          found = true
-          break
-        end
-      end
-
-      if not found then
-        -- missing at least one migration for a component: below 0.14
-        res.invalid_state = true
-        res.missing_component = name
-        res.missing_migration = needed_migration
-        return res
-      end
-    end
-  end
-
-  -- all migrations match: 0.14 install
-  res.is_014 = true
-
-  return res
-end
-
-
 local _M = {}
 
 
 function _M.new(kong_config)
   local config = {
-    host       = kong_config.pg_host,
-    port       = kong_config.pg_port,
-    timeout    = kong_config.pg_timeout,
-    user       = kong_config.pg_user,
-    password   = kong_config.pg_password,
-    database   = kong_config.pg_database,
-    schema     = "",
-    ssl        = kong_config.pg_ssl,
-    ssl_verify = kong_config.pg_ssl_verify,
-    cafile     = kong_config.lua_ssl_trusted_certificate,
+    host        = kong_config.pg_host,
+    port        = kong_config.pg_port,
+    timeout     = kong_config.pg_timeout,
+    user        = kong_config.pg_user,
+    password    = kong_config.pg_password,
+    database    = kong_config.pg_database,
+    schema      = kong_config.pg_schema or "",
+    ssl         = kong_config.pg_ssl,
+    ssl_verify  = kong_config.pg_ssl_verify,
+    cafile      = kong_config.lua_ssl_trusted_certificate,
+    sem_max     = kong_config.pg_max_concurrent_queries or 0,
+    sem_timeout = (kong_config.pg_semaphore_timeout or 60000) / 1000,
   }
 
   local db = pgmoon.new(config)
+
+  local sem
+  if config.sem_max > 0 then
+    local err
+    sem, err = semaphore.new(config.sem_max)
+    if not sem then
+      ngx.log(ngx.CRIT, "failed creating the PostgreSQL connector semaphore: ",
+                        err)
+    end
+  end
 
   return setmetatable({
     config            = config,
     escape_identifier = db.escape_identifier,
     escape_literal    = db.escape_literal,
+    sem               = sem,
   }, _mt)
 end
 

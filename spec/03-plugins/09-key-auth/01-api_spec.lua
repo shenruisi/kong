@@ -29,9 +29,9 @@ for _, strategy in helpers.each_strategy() do
         hosts = { "keyauth2.test" },
       }
 
-      consumer = bp.consumers:insert {
+      consumer = bp.consumers:insert({
         username = "bob"
-      }
+      }, { nulls = true })
 
       assert(helpers.start_kong({
         database   = strategy,
@@ -101,6 +101,49 @@ for _, strategy in helpers.each_strategy() do
 
           assert.not_equal(first_key, json.key)
         end)
+        it("creates a key-auth credential with tags", function()
+          local res = assert(admin_client:send {
+            method  = "POST",
+            path    = "/consumers/bob/key-auth",
+            body    = {
+              key   = "keyauth-with-tags",
+              tags  = { "tag1", "tag2"},
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(201, res)
+          local json = cjson.decode(body)
+          assert.equal(consumer.id, json.consumer.id)
+          assert.equal("tag1", json.tags[1])
+          assert.equal("tag2", json.tags[2])
+        end)
+        it("creates a key-auth credential with a ttl", function()
+          local res = assert(admin_client:send {
+            method  = "POST",
+            path    = "/consumers/bob/key-auth",
+            body    = {
+              ttl = 1,
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(201, res)
+          local json = cjson.decode(body)
+          assert.equal(consumer.id, json.consumer.id)
+          assert.is_string(json.key)
+
+          ngx.sleep(3)
+
+          local id = json.consumer.id
+          local res = assert(admin_client:send {
+            method  = "GET",
+            path    = "/consumers/bob/key-auth/" .. id,
+          })
+          assert.res_status(404, res)
+        end)
       end)
 
       describe("GET", function()
@@ -123,6 +166,31 @@ for _, strategy in helpers.each_strategy() do
           local json = cjson.decode(body)
           assert.is_table(json.data)
           assert.equal(3, #json.data)
+        end)
+      end)
+
+      describe("GET #ttl", function()
+        lazy_setup(function()
+          for i = 1, 3 do
+            bp.keyauth_credentials:insert({
+              consumer = { id = consumer.id },
+            }, { ttl = 10 })
+          end
+        end)
+        lazy_teardown(function()
+          db:truncate("keyauth_credentials")
+        end)
+        it("entries contain ttl when specified", function()
+          local res = assert(admin_client:send {
+            method  = "GET",
+            path    = "/consumers/bob/key-auth"
+          })
+          local body = assert.res_status(200, res)
+          local json = cjson.decode(body)
+          assert.is_table(json.data)
+          for _, credential in ipairs(json.data) do
+            assert.not_nil(credential.ttl)
+          end
         end)
       end)
     end)
@@ -170,6 +238,19 @@ for _, strategy in helpers.each_strategy() do
             path   = "/consumers/alice/key-auth/" .. credential.id
           })
           assert.res_status(404, res)
+        end)
+        it("key-auth credential contains #ttl", function()
+          local credential = bp.keyauth_credentials:insert({
+            consumer = { id = consumer.id },
+          }, { ttl = 10 })
+          local res = assert(admin_client:send {
+            method  = "GET",
+            path    = "/consumers/bob/key-auth/" .. credential.id
+          })
+          local body = assert.res_status(200, res)
+          local json = cjson.decode(body)
+          assert.equal(credential.id, json.id)
+          assert.not_nil(json.ttl)
         end)
       end)
 
@@ -297,7 +378,7 @@ for _, strategy in helpers.each_strategy() do
         assert.response(res).has.status(400)
         local body = assert.response(res).has.jsonbody()
         assert.equal("bad header name 'hello\\world', allowed characters are A-Z, a-z, 0-9, '_', and '-'",
-                     body.fields.config.key_names)
+                     body.fields.config.key_names[1])
       end)
       it("succeeds with valid key_names", function()
         local key_name = "hello-world"
@@ -392,6 +473,87 @@ for _, strategy in helpers.each_strategy() do
           -- next_page token, and thus, an offset proprty in the
           -- response of the Admin API.
           --assert.is_nil(json_2.offset) -- last page
+        end)
+      end)
+
+      describe("POST", function()
+        lazy_setup(function()
+          db:truncate("keyauth_credentials")
+        end)
+
+        it("does not create key-auth credential when missing consumer", function()
+          local res = assert(admin_client:send {
+            method = "POST",
+            path = "/key-auths",
+            body = {
+              key = "1234",
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(400, res)
+          local json = cjson.decode(body)
+          assert.same("schema violation (consumer: required field missing)", json.message)
+        end)
+
+        it("creates key-auth credential", function()
+          local res = assert(admin_client:send {
+            method = "POST",
+            path = "/key-auths",
+            body = {
+              key = "1234",
+              consumer = {
+                id = consumer.id
+              }
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(201, res)
+          local json = cjson.decode(body)
+          assert.equal("1234", json.key)
+        end)
+      end)
+    end)
+
+    describe("/key-auths/:credential_key_or_id", function()
+      describe("PUT", function()
+        lazy_setup(function()
+          db:truncate("keyauth_credentials")
+        end)
+
+        it("does not create key-auth credential when missing consumer", function()
+          local res = assert(admin_client:send {
+            method = "PUT",
+            path = "/key-auths/1234",
+            body = { },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(400, res)
+          local json = cjson.decode(body)
+          assert.same("schema violation (consumer: required field missing)", json.message)
+        end)
+
+        it("creates key-auth credential", function()
+          local res = assert(admin_client:send {
+            method = "PUT",
+            path = "/key-auths/1234",
+            body = {
+              consumer = {
+                id = consumer.id
+              }
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(200, res)
+          local json = cjson.decode(body)
+          assert.equal("1234", json.key)
         end)
       end)
     end)

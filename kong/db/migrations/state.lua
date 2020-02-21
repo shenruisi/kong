@@ -9,7 +9,9 @@ local Errors = require "kong.db.errors"
 
 local MigrationSchema = Schema.new(Migration)
 
+
 local fmt = string.format
+local max = math.max
 
 
 local function prefix_err(db, err)
@@ -26,6 +28,11 @@ local Migrations_mt = {
   __tostring = function(t)
     local subsystems = {}
 
+    local max_length = 0
+    for _, subsys in ipairs(t) do
+      max_length = max(max_length, #subsys.subsystem)
+    end
+
     for _, subsys in ipairs(t) do
       local names = {}
 
@@ -33,8 +40,8 @@ local Migrations_mt = {
         table.insert(names, migration.name)
       end
 
-      table.insert(subsystems, fmt("%s: %s", subsys.subsystem,
-                                             table.concat(names, ", ")))
+      table.insert(subsystems, fmt("%" .. max_length .. "s: %s",
+                                   subsys.subsystem, table.concat(names, ", ")))
     end
 
     return table.concat(subsystems, "\n")
@@ -171,7 +178,6 @@ end
 --   pending_migrations  = Subsystem[] | nil
 --   missing_migrations  = Subsystem[] | nil
 --   new_migrations      = Subsystem[] | nil,
---   legacy_is_014 = boolean,
 --   needs_bootstrap = boolean,
 -- }
 --
@@ -203,20 +209,13 @@ function State.load(db)
     return nil, prefix_err(db, err)
   end
 
-  local rows, err = db.connector:schema_migrations()
+  local rows, err = db.connector:schema_migrations(subsystems)
   if err then
     db.connector:close()
     return nil, prefix_err(db, "failed to check schema state: " .. err)
   end
 
-  local legacy_res, err = db.connector:is_014(rows)
-
   db.connector:close()
-
-  if err then
-    return nil, prefix_err(db, "failed to check legacy schema state: " ..
-      err)
-  end
 
   log.verbose("schema state retrieved")
 
@@ -226,14 +225,7 @@ function State.load(db)
     pending_migrations = nil,
     missing_migrations = nil,
     new_migrations = nil,
-    legacy_is_014 = legacy_res.is_014,
   }
-
-  if legacy_res.invalid_state then
-    schema_state.legacy_invalid_state = true
-    schema_state.legacy_missing_component = legacy_res.missing_component
-    schema_state.legacy_missing_migration = legacy_res.missing_migration
-  end
 
   local rows_as_hash = {}
 

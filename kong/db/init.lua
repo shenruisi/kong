@@ -3,7 +3,9 @@ local Entity       = require "kong.db.schema.entity"
 local Errors       = require "kong.db.errors"
 local Strategies   = require "kong.db.strategies"
 local MetaSchema   = require "kong.db.schema.metaschema"
+local constants    = require "kong.constants"
 local log          = require "kong.cmd.utils.log"
+local utils        = require "kong.tools.utils"
 
 
 local fmt          = string.format
@@ -13,24 +15,6 @@ local error        = error
 local ipairs       = ipairs
 local rawget       = rawget
 local setmetatable = setmetatable
-
-
--- maybe a temporary constant table -- could be move closer
--- to schemas and entities since schemas will also be used
--- independently from the DB module (Admin API for GUI)
--- Notice that the order in which they are listed is important:
--- schemas of dependencies need to be loaded first.
-local CORE_ENTITIES = {
-  "consumers",
-  "services",
-  "routes",
-  "certificates",
-  "snis",
-  "upstreams",
-  "targets",
-  "plugins",
-  "cluster_ca",
-}
 
 
 local DEFAULT_LOCKS_TTL = 60 -- seconds
@@ -64,7 +48,7 @@ function DB.new(kong_config, strategy)
     -- core entities are for now the only source of schemas.
     -- TODO: support schemas from plugins entities as well.
 
-    for _, entity_name in ipairs(CORE_ENTITIES) do
+    for _, entity_name in ipairs(constants.CORE_ENTITIES) do
       local entity_schema = require("kong.db.schema.entities." .. entity_name)
 
       -- validate core entities schema via metaschema
@@ -79,6 +63,18 @@ function DB.new(kong_config, strategy)
                         err)
       end
       schemas[entity_name] = entity
+
+      -- load core entities subschemas
+      local subschemas
+      ok, subschemas = utils.load_module_if_exists("kong.db.schema.entities." .. entity_name .. "_subschemas")
+      if ok then
+        for name, subschema in pairs(subschemas) do
+          local ok, err = entity:new_subschema(name, subschema)
+          if not ok then
+            return nil, ("error initializing schema for %s: %s"):format(entity_name, err)
+          end
+        end
+      end
     end
   end
 
@@ -232,25 +228,13 @@ end
 
 
 do
-  local resty_lock = require "resty.lock"
+  local concurrency = require "kong.concurrency"
+
   local knode = (kong and kong.node) and kong.node or
                 require "kong.pdk.node".new()
 
 
   local MAX_LOCK_WAIT_STEP = 2 -- seconds
-
-
-  local function release_rlock_and_ret(self, rlock, ...)
-    rlock:unlock()
-
-    local args = { ... }
-
-    if type(args[2]) == "string" then
-      args[2] = prefix_err(self, args[2])
-    end
-
-    return unpack(args)
-  end
 
 
   function DB:cluster_mutex(key, opts, cb)
@@ -317,90 +301,74 @@ do
       ttl = DEFAULT_LOCKS_TTL
     end
 
-    local rlock, err = resty_lock:new("kong_locks", {
-      exptime = ttl,
+    local mutex_opts = {
+      name = key,
       timeout = ttl,
-    })
-    if not rlock then
-      return nil, prefix_err(self, "failed to create worker lock: " .. err)
-    end
-
-    -- acquire a single worker
-
-    local elapsed, err = rlock:lock(key)
-    if not elapsed then
-      if err == "timeout" then
-        return nil, prefix_err(self, err)
+    }
+    return concurrency.with_worker_mutex(mutex_opts, function(elapsed)
+      if elapsed ~= 0 then
+        -- we did not acquire the worker lock, but it was released
+        return false
       end
 
-      return nil, prefix_err(self, "failed to acquire worker lock: " .. err)
-    end
+      -- worker lock acquired, other workers are waiting on it
+      -- now acquire cluster lock via strategy-specific connector
 
-    if elapsed ~= 0 then
-      -- we did not acquire the worker lock, but it was released
-      return false
-    end
-
-    -- worker lock acquired, other workers are waiting on it
-    -- now acquire cluster lock via strategy-specific connector
-
-    local ok, err = self.connector:insert_lock(key, ttl, owner)
-    if err then
-      return release_rlock_and_ret(self, rlock, nil,
-                                   "failed to insert cluster lock: " .. err)
-    end
-
-    if not ok then
-      if no_wait then
-        -- don't wait on cluster locked
-        return release_rlock_and_ret(self, rlock, false)
+      local ok, err = self.connector:insert_lock(key, ttl, owner)
+      if err then
+        return nil, prefix_err(self, "failed to insert cluster lock: " .. err)
       end
 
-      -- waiting on cluster lock
-      local step = 0.1
-      local cluster_elapsed = 0
-
-      while cluster_elapsed < ttl do
-        ngx.sleep(step)
-        cluster_elapsed = cluster_elapsed + step
-
-        if cluster_elapsed >= ttl then
-          break
+      if not ok then
+        if no_wait then
+          -- don't wait on cluster locked
+          return false
         end
 
-        local locked, err = self.connector:read_lock(key)
-        if err then
-          return release_rlock_and_ret(self, rlock, nil,
-                                       "failed to read cluster lock: " .. err)
+        -- waiting on cluster lock
+        local step = 0.1
+        local cluster_elapsed = 0
+
+        while cluster_elapsed < ttl do
+          ngx.sleep(step)
+          cluster_elapsed = cluster_elapsed + step
+
+          if cluster_elapsed >= ttl then
+            break
+          end
+
+          local locked, err = self.connector:read_lock(key)
+          if err then
+            return nil, prefix_err(self, "failed to read cluster lock: " .. err)
+          end
+
+          if not locked then
+            -- the cluster lock was released
+            return false
+          end
+
+          step = math.min(step * 3, MAX_LOCK_WAIT_STEP)
         end
 
-        if not locked then
-          -- the cluster lock was released
-          return release_rlock_and_ret(self, rlock, false)
-        end
-
-        step = math.min(step * 3, MAX_LOCK_WAIT_STEP)
+        return nil, prefix_err(self, "timeout")
       end
 
-      return release_rlock_and_ret(self, rlock, nil, "timeout")
-    end
+      -- cluster lock acquired, run callback
 
-    -- cluster lock acquired, run callback
+      local pok, perr = xpcall(cb, debug.traceback)
+      if not pok then
+        self.connector:remove_lock(key, owner)
 
-    local pok, perr = xpcall(cb, debug.traceback)
-    if not pok then
-      self.connector:remove_lock(key, owner)
+        return nil, prefix_err(self, "cluster_mutex callback threw an error: "
+                                     .. perr)
+      end
 
-      return release_rlock_and_ret(self, rlock, nil,
-                                   "cluster_mutex callback threw an error: "
-                                   .. perr)
-    end
+      if not no_cleanup then
+        self.connector:remove_lock(key, owner)
+      end
 
-    if not no_cleanup then
-      self.connector:remove_lock(key, owner)
-    end
-
-    return release_rlock_and_ret(self, rlock, true)
+      return true
+    end)
   end
 end
 
@@ -424,24 +392,6 @@ do
 
   function DB:last_schema_state()
     return last_schema_state or self:schema_state()
-  end
-
-
-  function DB:are_014_apis_present()
-    local ok, err = self.connector:connect_migrations({ no_keyspace = true })
-    if not ok then
-      return nil, prefix_err(self, err)
-    end
-
-    ok, err = self.connector:are_014_apis_present()
-
-    self.connector:close()
-
-    if err then
-      return nil, prefix_err(self, "failed checking for presence of 0.14 apis: " .. err)
-    end
-
-    return ok
   end
 
 
@@ -493,6 +443,26 @@ do
 
     local run_up = options.run_up
     local run_teardown = options.run_teardown
+
+    local skip_teardown_migrations = {}
+    if run_teardown and options.skip_teardown_migrations then
+      for _, t in ipairs(options.skip_teardown_migrations) do
+        for _, mig in ipairs(t.migrations) do
+          local ok, mod = utils.load_module_if_exists(t.namespace .. "." ..
+                                                      mig.name)
+          if ok then
+            local strategy_migration = mod[self.strategy]
+            if strategy_migration and strategy_migration.teardown then
+              if not skip_teardown_migrations[t.subsystem] then
+                skip_teardown_migrations[t.subsystem] = {}
+              end
+
+              skip_teardown_migrations[t.subsystem][mig.name] = true
+            end
+          end
+        end
+      end
+    end
 
     if not run_up and not run_teardown then
       error("options.run_up or options.run_teardown must be given", 2)
@@ -557,7 +527,10 @@ do
           end
         end
 
-        if run_teardown and strategy_migration.teardown then
+        local skip_teardown = skip_teardown_migrations[t.subsystem] and
+                              skip_teardown_migrations[t.subsystem][mig.name]
+
+        if not skip_teardown and run_teardown and strategy_migration.teardown then
           if run_up then
             -- ensure schema consensus is reached before running DML queries
             -- that could span all peers
@@ -604,8 +577,8 @@ do
         end
 
         log("%s migrated up to: %s %s", t.subsystem, mig.name,
-            strategy_migration.teardown
-            and not run_teardown and "(pending)" or "(executed)")
+            strategy_migration.teardown and not run_teardown and "(pending)"
+                                                              or "(executed)")
 
         n_migrations = n_migrations + 1
       end

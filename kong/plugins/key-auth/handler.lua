@@ -1,5 +1,4 @@
 local constants = require "kong.constants"
-local BasePlugin = require "kong.plugins.base_plugin"
 
 
 local kong = kong
@@ -9,16 +8,11 @@ local type = type
 local _realm = 'Key realm="' .. _KONG._NAME .. '"'
 
 
-local KeyAuthHandler = BasePlugin:extend()
+local KeyAuthHandler = {}
 
 
 KeyAuthHandler.PRIORITY = 1003
-KeyAuthHandler.VERSION = "1.0.0"
-
-
-function KeyAuthHandler:new()
-  KeyAuthHandler.super.new(self, "key-auth")
-end
+KeyAuthHandler.VERSION = "2.1.0"
 
 
 local function load_credential(key)
@@ -26,21 +20,8 @@ local function load_credential(key)
   if not cred then
     return nil, err
   end
-  return cred
-end
 
-
-local function load_consumer(consumer_id, anonymous)
-  local result, err = kong.db.consumers:select({ id = consumer_id })
-  if not result then
-    if anonymous and not err then
-      err = 'anonymous consumer "' .. consumer_id .. '" not found'
-    end
-
-    return nil, err
-  end
-
-  return result
+  return cred, nil, cred.ttl
 end
 
 
@@ -143,7 +124,7 @@ local function do_authentication(conf)
   end
 
   -- this request is missing an API key, HTTP 401
-  if not key then
+  if not key or key == "" then
     kong.response.set_header("WWW-Authenticate", _realm)
     return nil, { status = 401, message = "No API key found in request" }
   end
@@ -157,12 +138,14 @@ local function do_authentication(conf)
                                     key)
   if err then
     kong.log.err(err)
-    return kong.response.exit(500, "An unexpected error occurred")
+    return kong.response.exit(500, {
+      message = "An unexpected error occurred"
+    })
   end
 
-  -- no credential in DB, for this key, it is invalid, HTTP 403
+  -- no credential in DB, for this key, it is invalid, HTTP 401
   if not credential then
-    return nil, { status = 403, message = "Invalid authentication credentials" }
+    return nil, { status = 401, message = "Invalid authentication credentials" }
   end
 
   -----------------------------------------
@@ -172,7 +155,8 @@ local function do_authentication(conf)
   -- retrieve the consumer linked to this API key, to set appropriate headers
   local consumer_cache_key, consumer
   consumer_cache_key = kong.db.consumers:cache_key(credential.consumer.id)
-  consumer, err      = cache:get(consumer_cache_key, nil, load_consumer,
+  consumer, err      = cache:get(consumer_cache_key, nil,
+                                 kong.client.load_consumer,
                                  credential.consumer.id)
   if err then
     kong.log.err(err)
@@ -186,8 +170,6 @@ end
 
 
 function KeyAuthHandler:access(conf)
-  KeyAuthHandler.super.access(self)
-
   -- check if preflight request and whether it should be authenticated
   if not conf.run_on_preflight and kong.request.get_method() == "OPTIONS" then
     return
@@ -205,9 +187,10 @@ function KeyAuthHandler:access(conf)
       -- get anonymous user
       local consumer_cache_key = kong.db.consumers:cache_key(conf.anonymous)
       local consumer, err = kong.cache:get(consumer_cache_key, nil,
-                                           load_consumer, conf.anonymous, true)
+                                           kong.client.load_consumer,
+                                           conf.anonymous, true)
       if err then
-        kong.log.err(err)
+        kong.log.err("failed to load anonymous consumer:", err)
         return kong.response.exit(500, { message = "An unexpected error occurred" })
       end
 

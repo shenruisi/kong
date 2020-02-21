@@ -5,13 +5,13 @@ return {
     dao = "kong.plugins.acl.acls",
     name = "acls",
     primary_key = { "id" },
-    endpoint_key = "group",
     cache_key = { "consumer", "group" },
     fields = {
       { id = typedefs.uuid },
       { created_at = typedefs.auto_timestamp_s },
-      { consumer = { type = "foreign", reference = "consumers", default = ngx.null, on_delete = "cascade", }, },
+      { consumer = { type = "foreign", reference = "consumers", required = true, on_delete = "cascade" }, },
       { group = { type = "string", required = true } },
+      { tags  = typedefs.tags },
     },
   },
 }

@@ -16,7 +16,7 @@ return {
   name = "oauth2",
   fields = {
     { consumer = typedefs.no_consumer },
-    { run_on = typedefs.run_on_first },
+    { protocols = typedefs.protocols_http },
     { config = {
         type = "record",
         fields = {
@@ -30,7 +30,7 @@ return {
           { enable_password_grant = { type = "boolean", default = false, required = true }, },
           { hide_credentials = { type = "boolean", default = false, required = true }, },
           { accept_http_if_already_terminated = { type = "boolean", default = false }, },
-          { anonymous = { type = "string", uuid = true, legacy = true }, },
+          { anonymous = { type = "string" }, },
           { global_credentials = { type = "boolean", default = false }, },
           { auth_header_name = { type = "string", default = "authorization" }, },
           { refresh_token_ttl = { type = "number", default = 1209600, required = true }, },
@@ -48,6 +48,5 @@ return {
     },
   },
 }
-
 
 

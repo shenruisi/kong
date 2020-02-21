@@ -33,6 +33,15 @@ function Blueprint:remove(overrides, options)
 end
 
 
+function Blueprint:update(id, overrides, options)
+  local entity, err = self.dao:update(id, overrides, options)
+  if err then
+    error(err, 2)
+  end
+  return entity
+end
+
+
 function Blueprint:insert_n(n, overrides, options)
   local res = {}
   for i=1,n do
@@ -77,7 +86,7 @@ function _M.new(db)
   local sni_seq = new_sequence("server-name-%d")
   res.snis = new_blueprint(db.snis, function(overrides)
     return {
-      name        = sni_seq:next(),
+      name        = overrides.name or sni_seq:next(),
       certificate = overrides.certificate or res.certificates:insert(),
     }
   end)
@@ -89,13 +98,22 @@ function _M.new(db)
     }
   end)
 
+  res.ca_certificates = new_blueprint(db.ca_certificates, function()
+    return {
+      cert = ssl_fixtures.cert_ca,
+    }
+  end)
+
   local upstream_name_seq = new_sequence("upstream-%d")
   res.upstreams = new_blueprint(db.upstreams, function(overrides)
     local slots = overrides.slots or 100
+    local name = overrides.name or upstream_name_seq:next()
+    local host_header = overrides.host_header or nil
 
     return {
-      name      = upstream_name_seq:next(),
+      name      = name,
       slots     = slots,
+      host_header = host_header,
     }
   end)
 

@@ -23,7 +23,10 @@ describe("Plugin: response-transformer", function()
     _G.ngx = {
       headers_sent = false,
       resp = {
-      }
+      },
+      config = {
+        subsystem = "http",
+      },
     }
     _G.kong = {
       response = require "kong.pdk.response".new(),
@@ -34,6 +37,18 @@ describe("Plugin: response-transformer", function()
       }
     }
 
+    -- mock since FFI based ngx.resp.add_header won't work in this setup
+    _G.kong.response.add_header = function(name, value)
+      local new_value = _G.kong.response.get_headers()[name]
+      if type(new_value) ~= "table" then
+        new_value = { new_value }
+      end
+
+      table.insert(new_value, value)
+
+      ngx.header[name] = new_value
+    end
+
     header_transformer = require "kong.plugins.response-transformer.header_transformer"
   end)
   describe("execute_headers()", function()
@@ -41,6 +56,9 @@ describe("Plugin: response-transformer", function()
       local conf  = {
         remove    = {
           headers = {"h1", "h2", "h3"}
+        },
+        rename   = {
+          headers = {}
         },
         replace   = {
           headers = {}
@@ -64,9 +82,55 @@ describe("Plugin: response-transformer", function()
         assert.is_nil(headers[CONTENT_LENGTH])
       end)
     end)
+    describe("rename", function()
+      local conf  = {
+        remove    = {
+          json = {},
+          headers = {}
+        },
+        rename   = {
+          headers = {"h1:h2", "h3:h4"}
+        },
+        replace   = {
+          json    = {},
+          headers = {}
+        },
+        add       = {
+          json    = {},
+          headers = {}
+        },
+        append    = {
+          json    = {},
+          headers = {}
+        }
+      }
+      it("header if the header exists", function()
+        local headers = get_headers({ h1 = "v1", h3 = "v3"})
+        header_transformer.transform_headers(conf, headers)
+        assert.same({h2 = "v1", h4 = "v3"}, headers)
+      end)
+      it("header if the header exists and is empty", function()
+        local headers = get_headers({ h1 = ""})
+        header_transformer.transform_headers(conf, headers)
+        assert.same({h2 = " "}, headers)
+      end)
+      it("does not add as new header if header is nil", function()
+        local headers = get_headers({ h1 = nil})
+        header_transformer.transform_headers(conf, headers)
+        assert.same({h1 = nil}, headers)
+      end)
+      it("does not add as new header if header is not present", function()
+        local headers = get_headers({})
+        header_transformer.transform_headers(conf, headers)
+        assert.same({}, headers)
+      end)
+    end)
     describe("replace", function()
       local conf  = {
         remove    = {
+          headers = {}
+        },
+        rename   = {
           headers = {}
         },
         replace   = {
@@ -101,6 +165,9 @@ describe("Plugin: response-transformer", function()
         remove    = {
           headers = {}
         },
+        rename   = {
+          headers = {}
+        },
         replace   = {
           headers = {}
         },
@@ -131,6 +198,9 @@ describe("Plugin: response-transformer", function()
     describe("append", function()
       local conf  = {
         remove    = {
+          headers = {}
+        },
+        rename   = {
           headers = {}
         },
         replace   = {
@@ -165,6 +235,9 @@ describe("Plugin: response-transformer", function()
         remove    = {
           headers = {"h1:v1"}
         },
+        rename   = {
+          headers = {}
+        },
         replace   = {
           headers = {"h2:v3"}
         },
@@ -193,6 +266,9 @@ describe("Plugin: response-transformer", function()
           remove    = {
             json    = {"p1"},
             headers = {"h1", "h2"}
+          },
+          rename   = {
+            headers = {}
           },
           replace   = {
             json    = {},
@@ -233,6 +309,9 @@ describe("Plugin: response-transformer", function()
         local conf  = {
           remove    = {
             json    = {},
+            headers = {}
+          },
+          rename   = {
             headers = {}
           },
           replace   = {
@@ -276,6 +355,9 @@ describe("Plugin: response-transformer", function()
             json    = {},
             headers = {}
           },
+          rename   = {
+            headers = {}
+          },
           replace   = {
             json    = {},
             headers = {}
@@ -315,6 +397,9 @@ describe("Plugin: response-transformer", function()
         local conf  = {
           remove    = {
             json    = {},
+            headers = {}
+          },
+          rename   = {
             headers = {}
           },
           replace   = {

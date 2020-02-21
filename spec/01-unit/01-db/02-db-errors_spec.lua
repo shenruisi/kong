@@ -1,5 +1,6 @@
 local helpers = require "spec.helpers"
 local Errors = require "kong.db.errors"
+local defaults = require "kong.db.strategies.connector".defaults
 
 local fmt      = string.format
 local unindent = helpers.unindent
@@ -52,7 +53,32 @@ describe("DB Errors", function()
           code = Errors.codes.INVALID_PRIMARY_KEY,
           name = "invalid primary key",
           strategy = "some_strategy",
-          message = [[invalid primary key: '{id2="missing2",id="missing"}']],
+          message = [[invalid primary key: '{id="missing",id2="missing2"}']],
+          fields = pk,
+        }, err_t)
+      end)
+
+      it("__tostring", function()
+        local s = fmt("[%s] %s", err_t.strategy, err_t.message)
+        assert.equals(s, tostring(err_t))
+      end)
+    end)
+
+
+    describe("INVALID_FOREIGN_KEY", function()
+      local pk = {
+        id = "missing",
+        id2 = "missing2",
+      }
+
+      local err_t = e:invalid_foreign_key(pk)
+
+      it("creates", function()
+        assert.same({
+          code = Errors.codes.INVALID_FOREIGN_KEY,
+          name = "invalid foreign key",
+          strategy = "some_strategy",
+          message = [[invalid foreign key: '{id="missing",id2="missing2"}']],
           fields = pk,
         }, err_t)
       end)
@@ -292,15 +318,44 @@ describe("DB Errors", function()
     end)
 
 
+    describe("TRANSFORMATION_ERROR", function()
+      it("creates", function()
+        local err_t = e:transformation_error()
+        assert.same({
+          code = Errors.codes.TRANSFORMATION_ERROR,
+          name = "transformation error",
+          strategy = "some_strategy",
+          message = "transformation error",
+        }, err_t)
+
+        local s = fmt("[%s] %s", err_t.strategy, err_t.message)
+        assert.equals(s, tostring(err_t))
+      end)
+
+      it("creates with error string as message", function()
+        local err_t = e:transformation_error("timeout")
+        assert.same({
+          code = Errors.codes.TRANSFORMATION_ERROR,
+          name = "transformation error",
+          strategy = "some_strategy",
+          message = "timeout",
+        }, err_t)
+
+        local s = fmt("[%s] %s", err_t.strategy, err_t.message)
+        assert.equals(s, tostring(err_t))
+      end)
+    end)
+
+
     describe("INVALID_SIZE", function()
-      local err_t = e:invalid_size("size must be an integer between 1 and 1000")
+      local err_t = e:invalid_size("size must be an integer between 1 and " .. defaults.pagination.max_page_size)
 
       it("creates", function()
         assert.same({
           code = Errors.codes.INVALID_SIZE,
           name = "invalid size",
           strategy = "some_strategy",
-          message = "size must be an integer between 1 and 1000",
+          message = "size must be an integer between 1 and " .. defaults.pagination.max_page_size,
         }, err_t)
       end)
 

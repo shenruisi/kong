@@ -22,7 +22,9 @@ local cmds = {
   prepare = true,
   migrations = true,
   version = true,
-  roar = true
+  config = true,
+  roar = true,
+  hybrid = true,
 }
 
 for k in pairs(cmds) do
@@ -38,8 +40,7 @@ The available commands are:
  %s
 
 Options:
-%s
-]], table.concat(cmds_arr, "\n "), options)
+%s]], table.concat(cmds_arr, "\n "), options)
 
 return function(args)
   local cmd_name = table.remove(args, 1)

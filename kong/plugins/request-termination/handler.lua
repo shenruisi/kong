@@ -1,4 +1,3 @@
-local BasePlugin = require "kong.plugins.base_plugin"
 local singletons = require "kong.singletons"
 local constants = require "kong.constants"
 local meta = require "kong.meta"
@@ -18,21 +17,14 @@ local DEFAULT_RESPONSE = {
 }
 
 
-local RequestTerminationHandler = BasePlugin:extend()
+local RequestTerminationHandler = {}
 
 
 RequestTerminationHandler.PRIORITY = 2
-RequestTerminationHandler.VERSION = "1.0.0"
-
-
-function RequestTerminationHandler:new()
-  RequestTerminationHandler.super.new(self, "request-termination")
-end
+RequestTerminationHandler.VERSION = "2.0.0"
 
 
 function RequestTerminationHandler:access(conf)
-  RequestTerminationHandler.super.access(self)
-
   local status  = conf.status_code
   local content = conf.body
 
@@ -48,7 +40,8 @@ function RequestTerminationHandler:access(conf)
     return kong.response.exit(status, content, headers)
   end
 
-  return kong.response.exit(status, { message = conf.message or DEFAULT_RESPONSE[status] })
+  local message = conf.message or DEFAULT_RESPONSE[status]
+  return kong.response.exit(status, message and { message = message } or nil)
 end
 
 

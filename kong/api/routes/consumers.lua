@@ -1,6 +1,5 @@
 local endpoints = require "kong.api.endpoints"
-local reports = require "kong.reports"
-local utils = require "kong.tools.utils"
+local cjson = require "cjson"
 
 
 local kong = kong
@@ -14,32 +13,19 @@ return {
 
       -- Search by custom_id: /consumers?custom_id=xxx
       if args.custom_id then
-        self.params.consumers = args.custom_id
-        local consumer, _, err_t = endpoints.select_entity(self, db, db.consumers.schema, "select_by_custom_id")
+        local opts = endpoints.extract_options(args, db.consumers.schema, "select")
+        local consumer, _, err_t = db.consumers:select_by_custom_id(args.custom_id, opts)
         if err_t then
           return endpoints.handle_error(err_t)
         end
 
         return kong.response.exit(200, {
-          data = { consumer },
+          data = setmetatable({ consumer }, cjson.array_mt),
           next = null,
         })
       end
 
       return parent()
-    end,
-  },
-
-  ["/consumers/:consumers/plugins"] = {
-    POST = function(_, _, _, parent)
-      local post_process = function(data)
-        local r_data = utils.deep_copy(data)
-        r_data.config = nil
-        r_data.e = "c"
-        reports.send("api", r_data)
-        return data
-      end
-      return parent(post_process)
     end,
   },
 }

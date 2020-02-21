@@ -1,8 +1,9 @@
 local Schema = require "kong.db.schema"
 local services = require "kong.db.schema.entities.services"
+local certificates = require "kong.db.schema.entities.certificates"
 
-
-local Services = Schema.new(services)
+assert(Schema.new(certificates))
+local Services = assert(Schema.new(services))
 
 
 describe("services", function()
@@ -96,6 +97,45 @@ describe("services", function()
     assert.same(service.connect_timeout, 60000)
     assert.same(service.write_timeout, 60000)
     assert.same(service.read_timeout, 60000)
+  end)
+
+  describe("timeout attributes", function()
+    -- refusals
+    it("should not be zero", function()
+      local service = {
+        host            = "example.com",
+        port            = 80,
+        protocol        = "https",
+        connect_timeout = 0,
+        read_timeout    = 0,
+        write_timeout   = 0,
+      }
+
+      local ok, err = Services:validate(service)
+      assert.falsy(ok)
+      assert.equal("value should be between 1 and 2147483646",
+                   err.connect_timeout)
+      assert.equal("value should be between 1 and 2147483646",
+                   err.read_timeout)
+      assert.equal("value should be between 1 and 2147483646",
+                   err.write_timeout)
+    end)
+
+    -- acceptance
+    it("should be greater than zero", function()
+      local service = {
+        host            = "example.com",
+        port            = 80,
+        protocol        = "https",
+        connect_timeout = 1,
+        read_timeout    = 10,
+        write_timeout   = 100,
+      }
+
+      local ok, err = Services:validate(service)
+      assert.is_nil(err)
+      assert.is_true(ok)
+    end)
   end)
 
   describe("path attribute", function()
@@ -460,8 +500,32 @@ describe("services", function()
       assert.is_true(ok)
     end)
 
-    it("if 'protocol = tcp/tls', then 'path' is empty", function()
-      for _, v in ipairs({ "tcp", "tls" }) do
+    it("'protocol' accepts 'grpc'", function()
+      local service = {
+        protocol = "grpc",
+        host = "x.y",
+        port = 80,
+      }
+
+      local ok, err = Services:validate(service)
+      assert.is_nil(err)
+      assert.is_true(ok)
+    end)
+
+    it("'protocol' accepts 'grpcs'", function()
+      local service = {
+        protocol = "grpcs",
+        host = "x.y",
+        port = 80,
+      }
+
+      local ok, err = Services:validate(service)
+      assert.is_nil(err)
+      assert.is_true(ok)
+    end)
+
+    it("if 'protocol = tcp/tls/grpc/grpcs', then 'path' is empty", function()
+      for _, v in ipairs({ "tcp", "tls", "grpc", "grpcs" }) do
         local service = {
           protocol = v,
           host = "x.y",

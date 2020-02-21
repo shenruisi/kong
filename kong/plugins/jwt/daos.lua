@@ -1,14 +1,14 @@
 local typedefs = require "kong.db.schema.typedefs"
-local openssl_pkey = require "openssl.pkey"
-
+local openssl_pkey = require "resty.openssl.pkey"
 
 local function validate_ssl_key(key)
-  if not pcall(openssl_pkey.new, key) then
+  local _, err =  openssl_pkey.new(key)
+  if err then
     return nil, "invalid key"
   end
+
   return true
 end
-
 
 return {
   jwt_secrets = {
@@ -16,10 +16,12 @@ return {
     primary_key = { "id" },
     cache_key = { "key" },
     endpoint_key = "key",
+    admin_api_name = "jwts",
+    admin_api_nested_name = "jwt",
     fields = {
       { id = typedefs.uuid },
       { created_at = typedefs.auto_timestamp_s },
-      { consumer = { type = "foreign", reference = "consumers", default = ngx.null, on_delete = "cascade", }, },
+      { consumer = { type = "foreign", reference = "consumers", required = true, on_delete = "cascade", }, },
       { key = { type = "string", required = false, unique = true, auto = true }, },
       { secret = { type = "string", auto = true }, },
       { rsa_public_key = { type = "string" }, },
@@ -35,6 +37,7 @@ return {
             "ES256",
           },
       }, },
+      { tags = typedefs.tags },
     },
     entity_checks = {
       { conditional = { if_field = "algorithm",

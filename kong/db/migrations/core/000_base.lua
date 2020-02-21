@@ -11,8 +11,19 @@ return {
         "data"       TEXT
       );
 
-      CREATE INDEX IF NOT EXISTS "idx_cluster_events_at"      ON "cluster_events" ("at");
-      CREATE INDEX IF NOT EXISTS "idx_cluster_events_channel" ON "cluster_events" ("channel");
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "cluster_events_at_idx" ON "cluster_events" ("at");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
+
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "cluster_events_channel_idx" ON "cluster_events" ("channel");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
 
       CREATE OR REPLACE FUNCTION "delete_expired_cluster_events" () RETURNS TRIGGER
       LANGUAGE plpgsql
@@ -53,38 +64,26 @@ return {
         "id"              UUID                       PRIMARY KEY,
         "created_at"      TIMESTAMP WITH TIME ZONE,
         "updated_at"      TIMESTAMP WITH TIME ZONE,
+        "name"            TEXT                       UNIQUE,
         "service_id"      UUID                       REFERENCES "services" ("id"),
         "protocols"       TEXT[],
         "methods"         TEXT[],
         "hosts"           TEXT[],
         "paths"           TEXT[],
+        "snis"            TEXT[],
+        "sources"         JSONB[],
+        "destinations"    JSONB[],
         "regex_priority"  BIGINT,
         "strip_path"      BOOLEAN,
         "preserve_host"   BOOLEAN
-
       );
 
-      CREATE INDEX IF NOT EXISTS "routes_fkey_service" ON "routes" ("service_id");
-
-
-
-      CREATE TABLE IF NOT EXISTS "apis" (
-        "id"                        UUID                         PRIMARY KEY,
-        "created_at"                TIMESTAMP WITHOUT TIME ZONE  DEFAULT (CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC'),
-        "name"                      TEXT                         UNIQUE,
-        "upstream_url"              TEXT,
-        "preserve_host"             BOOLEAN                      NOT NULL,
-        "retries"                   SMALLINT                     DEFAULT 5,
-        "https_only"                BOOLEAN,
-        "http_if_terminated"        BOOLEAN,
-        "hosts"                     TEXT,
-        "uris"                      TEXT,
-        "methods"                   TEXT,
-        "strip_uri"                 BOOLEAN,
-        "upstream_connect_timeout"  INTEGER,
-        "upstream_send_timeout"     INTEGER,
-        "upstream_read_timeout"     INTEGER
-      );
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "routes_service_id_idx" ON "routes" ("service_id");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
 
 
 
@@ -104,43 +103,86 @@ return {
         "certificate_id"  UUID                       REFERENCES "certificates" ("id")
       );
 
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "snis_certificate_id_idx" ON "snis" ("certificate_id");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
+
+
 
       CREATE TABLE IF NOT EXISTS "consumers" (
         "id"          UUID                         PRIMARY KEY,
-        "created_at"  TIMESTAMP WITHOUT TIME ZONE  DEFAULT (CURRENT_TIMESTAMP(0) AT TIME ZONE 'UTC'),
+        "created_at"  TIMESTAMP WITH TIME ZONE     DEFAULT (CURRENT_TIMESTAMP(0) AT TIME ZONE 'UTC'),
         "username"    TEXT                         UNIQUE,
         "custom_id"   TEXT                         UNIQUE
       );
 
-      CREATE INDEX IF NOT EXISTS "username_idx" ON "consumers" (LOWER("username"));
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "consumers_username_idx" ON "consumers" (LOWER("username"));
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
 
 
 
       CREATE TABLE IF NOT EXISTS "plugins" (
         "id"           UUID                         UNIQUE,
-        "created_at"   TIMESTAMP WITHOUT TIME ZONE  DEFAULT (CURRENT_TIMESTAMP(0) AT TIME ZONE 'UTC'),
+        "created_at"   TIMESTAMP WITH TIME ZONE     DEFAULT (CURRENT_TIMESTAMP(0) AT TIME ZONE 'UTC'),
         "name"         TEXT                         NOT NULL,
         "consumer_id"  UUID                         REFERENCES "consumers" ("id") ON DELETE CASCADE,
         "service_id"   UUID                         REFERENCES "services"  ("id") ON DELETE CASCADE,
         "route_id"     UUID                         REFERENCES "routes"    ("id") ON DELETE CASCADE,
-        "api_id"       UUID                         REFERENCES "apis"      ("id") ON DELETE CASCADE,
-        "config"       JSON                         NOT NULL,
+        "config"       JSONB                        NOT NULL,
         "enabled"      BOOLEAN                      NOT NULL,
+        "cache_key"    TEXT                         UNIQUE,
+        "run_on"       TEXT,
 
-        PRIMARY KEY ("id", "name")
+        PRIMARY KEY ("id")
       );
 
-      CREATE INDEX IF NOT EXISTS "plugins_name_idx"       ON "plugins" ("name");
-      CREATE INDEX IF NOT EXISTS "plugins_consumer_idx"   ON "plugins" ("consumer_id");
-      CREATE INDEX IF NOT EXISTS "plugins_service_id_idx" ON "plugins" ("service_id");
-      CREATE INDEX IF NOT EXISTS "plugins_route_id_idx"   ON "plugins" ("route_id");
-      CREATE INDEX IF NOT EXISTS "plugins_api_idx"        ON "plugins" ("api_id");
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "plugins_name_idx" ON "plugins" ("name");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
+
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "plugins_consumer_id_idx" ON "plugins" ("consumer_id");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
+
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "plugins_service_id_idx" ON "plugins" ("service_id");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
+
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "plugins_route_id_idx" ON "plugins" ("route_id");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
+
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "plugins_run_on_idx" ON "plugins" ("run_on");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
 
 
 
       CREATE TABLE IF NOT EXISTS "upstreams" (
         "id"                    UUID                         PRIMARY KEY,
-        "created_at"            TIMESTAMP WITHOUT TIME ZONE  DEFAULT (CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC'),
+        "created_at"            TIMESTAMP WITH TIME ZONE     DEFAULT (CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC'),
         "name"                  TEXT                         UNIQUE,
         "hash_on"               TEXT,
         "hash_fallback"         TEXT,
@@ -149,21 +191,40 @@ return {
         "hash_on_cookie"        TEXT,
         "hash_on_cookie_path"   TEXT,
         "slots"                 INTEGER                      NOT NULL,
-        "healthchecks"          JSON
+        "healthchecks"          JSONB
       );
 
 
 
       CREATE TABLE IF NOT EXISTS "targets" (
         "id"           UUID                         PRIMARY KEY,
-        "created_at"   TIMESTAMP WITHOUT TIME ZONE  DEFAULT (CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC'),
+        "created_at"   TIMESTAMP WITH TIME ZONE     DEFAULT (CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC'),
         "upstream_id"  UUID                         REFERENCES "upstreams" ("id") ON DELETE CASCADE,
         "target"       TEXT                         NOT NULL,
         "weight"       INTEGER                      NOT NULL
       );
 
-      CREATE INDEX IF NOT EXISTS "targets_target_idx" ON "targets" ("target");
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "targets_target_idx" ON "targets" ("target");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
 
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "targets_upstream_id_idx" ON "targets" ("upstream_id");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
+
+
+
+      CREATE TABLE IF NOT EXISTS "cluster_ca" (
+        "pk"    BOOLEAN  NOT NULL  PRIMARY KEY CHECK(pk=true),
+        "key"   TEXT     NOT NULL,
+        "cert"  TEXT     NOT NULL
+      );
 
 
       -- TODO: delete on 1.0.0 migrations
@@ -177,7 +238,12 @@ return {
         PRIMARY KEY ("primary_key_value", "table_name")
       );
 
-      CREATE INDEX IF NOT EXISTS "ttls_primary_uuid_value_idx" ON "ttls" ("primary_uuid_value");
+      DO $$
+      BEGIN
+        CREATE INDEX IF NOT EXISTS "ttls_primary_uuid_value_idx" ON "ttls" ("primary_uuid_value");
+      EXCEPTION WHEN UNDEFINED_COLUMN THEN
+        -- Do nothing, accept existing state
+      END$$;
 
       CREATE OR REPLACE FUNCTION "upsert_ttl" (v_primary_key_value TEXT, v_primary_uuid_value UUID, v_primary_key_name TEXT, v_table_name TEXT, v_expire_at TIMESTAMP WITHOUT TIME ZONE) RETURNS void
       LANGUAGE plpgsql
@@ -245,10 +311,14 @@ return {
         id             uuid,
         created_at     timestamp,
         updated_at     timestamp,
+        name           text,
         hosts          list<text>,
         paths          list<text>,
         methods        set<text>,
         protocols      set<text>,
+        snis           set<text>,
+        sources        set<text>,
+        destinations   set<text>,
         preserve_host  boolean,
         strip_path     boolean,
         service_id     uuid,
@@ -256,6 +326,7 @@ return {
         PRIMARY KEY    (partition, id)
       );
       CREATE INDEX IF NOT EXISTS routes_service_id_idx ON routes(service_id);
+      CREATE INDEX IF NOT EXISTS routes_name_idx ON routes(name);
 
 
 
@@ -297,22 +368,23 @@ return {
 
       CREATE TABLE IF NOT EXISTS plugins(
         id          uuid,
-        name        text,
-        api_id      uuid,
-        config      text,
-        consumer_id uuid,
         created_at  timestamp,
-        enabled     boolean,
         route_id    uuid,
         service_id  uuid,
-        PRIMARY KEY (id, name)
+        consumer_id uuid,
+        name        text,
+        config      text,
+        enabled     boolean,
+        cache_key   text,
+        run_on      text,
+        PRIMARY KEY (id)
       );
       CREATE INDEX IF NOT EXISTS plugins_name_idx ON plugins(name);
-      CREATE INDEX IF NOT EXISTS plugins_api_id_idx ON plugins(api_id);
       CREATE INDEX IF NOT EXISTS plugins_route_id_idx ON plugins(route_id);
       CREATE INDEX IF NOT EXISTS plugins_service_id_idx ON plugins(service_id);
       CREATE INDEX IF NOT EXISTS plugins_consumer_id_idx ON plugins(consumer_id);
-
+      CREATE INDEX IF NOT EXISTS plugins_cache_key_idx ON plugins(cache_key);
+      CREATE INDEX IF NOT EXISTS plugins_run_on_idx ON plugins(run_on);
 
 
       CREATE TABLE IF NOT EXISTS upstreams(
@@ -343,25 +415,11 @@ return {
       CREATE INDEX IF NOT EXISTS targets_target_idx ON targets(target);
 
 
-
-      CREATE TABLE IF NOT EXISTS apis(
-        id                       uuid PRIMARY KEY,
-        created_at               timestamp,
-        hosts                    text,
-        http_if_terminated       boolean,
-        https_only               boolean,
-        methods                  text,
-        name                     text,
-        preserve_host            boolean,
-        retries                  int,
-        strip_uri                boolean,
-        upstream_connect_timeout int,
-        upstream_read_timeout    int,
-        upstream_send_timeout    int,
-        upstream_url             text,
-        uris                     text
+      CREATE TABLE IF NOT EXISTS cluster_ca(
+        pk boolean PRIMARY KEY,
+        key text,
+        cert text
       );
-      CREATE INDEX IF NOT EXISTS apis_name_idx ON apis(name);
     ]],
   },
 }

@@ -1,15 +1,21 @@
 local cjson = require "cjson.safe"
 local utils = require "kong.tools.utils"
 local constants = require "kong.constants"
+local counter = require "resty.counter"
 
 
 local kong_dict = ngx.shared.kong
-local udp_sock = ngx.socket.udp
+local ngx = ngx
+local tcp_sock = ngx.socket.tcp
 local timer_at = ngx.timer.at
 local ngx_log = ngx.log
+local var = ngx.var
+local subsystem = ngx.config.subsystem
 local concat = table.concat
 local tostring = tostring
+local lower = string.lower
 local pairs = pairs
+local error = error
 local type = type
 local WARN = ngx.WARN
 local sub = string.sub
@@ -17,7 +23,25 @@ local sub = string.sub
 
 local PING_INTERVAL = 3600
 local PING_KEY = "events:reports"
-local BUFFERED_REQUESTS_COUNT_KEYS = "events:requests"
+
+
+local REQUEST_COUNT_KEY       = "events:requests"
+local HTTP_REQUEST_COUNT_KEY  = "events:requests:http"
+local HTTPS_REQUEST_COUNT_KEY = "events:requests:https"
+local H2C_REQUEST_COUNT_KEY   = "events:requests:h2c"
+local H2_REQUEST_COUNT_KEY    = "events:requests:h2"
+local GRPC_REQUEST_COUNT_KEY  = "events:requests:grpc"
+local GRPCS_REQUEST_COUNT_KEY = "events:requests:grpcs"
+local WS_REQUEST_COUNT_KEY    = "events:requests:ws"
+local WSS_REQUEST_COUNT_KEY   = "events:requests:wss"
+
+
+local STREAM_COUNT_KEY        = "events:streams"
+local TCP_STREAM_COUNT_KEY    = "events:streams:tcp"
+local TLS_STREAM_COUNT_KEY    = "events:streams:tls"
+
+
+local GO_PLUGINS_REQUEST_COUNT_KEY = "events:requests:go_plugins"
 
 
 local _buffer = {}
@@ -26,6 +50,8 @@ local _enabled = false
 local _unique_str = utils.random_string()
 local _buffer_immutable_idx
 
+-- the resty.counter instance, will be initialized in `init_worker`
+local report_counter = nil
 
 do
   -- initialize immutable buffer data (the same for each report)
@@ -68,7 +94,7 @@ local function serialize_report_value(v)
 end
 
 
--- UDP logger
+-- TCP logger
 
 
 local function send_report(signal_type, t, host, port)
@@ -100,26 +126,19 @@ local function send_report(signal_type, t, host, port)
     end
   end
 
-  local sock = udp_sock()
-  local ok, err = sock:setpeername(host, port)
+  local sock = tcp_sock()
+  sock:settimeouts(30000, 30000, 30000)
+
+  -- errors are not logged to avoid false positives for users
+  -- who run Kong in an air-gapped environments
+
+  local ok = sock:connect(host, port)
   if not ok then
-    log(WARN, "could not set peer name for UDP socket: ", err)
     return
   end
 
-  sock:settimeout(1000)
-
-  -- concat and send buffer
-
-  ok, err = sock:send(concat(_buffer, ";", 1, mutable_idx))
-  if not ok then
-    log(WARN, "could not send data: ", err)
-  end
-
-  ok, err = sock:close()
-  if not ok then
-    log(WARN, "could not close socket: ", err)
-  end
+  sock:send(concat(_buffer, ";", 1, mutable_idx) .. "\n")
+  sock:setkeepalive()
 end
 
 
@@ -149,6 +168,135 @@ local function create_timer(...)
   end
 end
 
+-- @param interval exposed for unit test only
+local function create_counter(interval)
+  local err
+  -- create a counter instance which syncs to `kong` shdict every 10 minutes
+  report_counter, err = counter.new('kong', interval or 600)
+  return err
+end
+
+
+local function get_counter(key)
+  local count, err = report_counter:get(key)
+  if err then
+    log(WARN, "could not get ", key, " from 'kong' shm: ", err)
+  end
+  return count or 0
+end
+
+
+local function reset_counter(key, amount)
+  local ok, err = report_counter:reset(key, amount)
+  if not ok then
+    log(WARN, "could not reset ", key, " in 'kong' shm: ", err)
+  end
+end
+
+
+local function incr_counter(key)
+  local ok, err = report_counter:incr(key, 1)
+  if not ok then
+    log(WARN, "could not increment ", key, " in 'kong' shm: ", err)
+  end
+end
+
+
+-- returns a string indicating the "kind" of the current request/stream:
+-- "http", "https", "h2c", "h2", "grpc", "grpcs", "ws", "wss", "tcp", "tls"
+-- or nil + error message if the suffix could not be determined
+local function get_current_suffix()
+  if subsystem == "stream" then
+    if var.ssl_protocol then
+      return "tls"
+    end
+
+    return "tcp"
+  end
+
+  local scheme = var.scheme
+  if scheme == "http" or scheme == "https" then
+    local proxy_mode = var.kong_proxy_mode
+    if proxy_mode == "http" then
+      local http_upgrade = var.http_upgrade
+      if http_upgrade and lower(http_upgrade) == "websocket" then
+        if scheme == "http" then
+          return "ws"
+        end
+
+        return "wss"
+      end
+
+      if ngx.req.http_version() == 2 then
+        if scheme == "http" then
+          return "h2c"
+        end
+
+        return "h2"
+      end
+
+      return scheme
+    end
+
+    if proxy_mode == "grpc" then
+      if scheme == "http" then
+        return "grpc"
+      end
+
+      if scheme == "https" then
+        return "grpcs"
+      end
+    end
+  end
+
+  return nil, "unknown request scheme: " .. tostring(scheme)
+end
+
+
+local function send_ping(host, port)
+  _ping_infos.unique_id = _unique_str
+
+  if subsystem == "stream" then
+    _ping_infos.streams     = get_counter(STREAM_COUNT_KEY)
+    _ping_infos.tcp_streams = get_counter(TCP_STREAM_COUNT_KEY)
+    _ping_infos.tls_streams = get_counter(TLS_STREAM_COUNT_KEY)
+    _ping_infos.go_plugin_reqs = get_counter(GO_PLUGINS_REQUEST_COUNT_KEY)
+
+    send_report("ping", _ping_infos, host, port)
+
+    reset_counter(STREAM_COUNT_KEY, _ping_infos.streams)
+    reset_counter(TCP_STREAM_COUNT_KEY, _ping_infos.tcp_streams)
+    reset_counter(TLS_STREAM_COUNT_KEY, _ping_infos.tls_streams)
+    reset_counter(GO_PLUGINS_REQUEST_COUNT_KEY, _ping_infos.go_plugin_reqs)
+
+    return
+  end
+
+  _ping_infos.requests       = get_counter(REQUEST_COUNT_KEY)
+  _ping_infos.http_reqs      = get_counter(HTTP_REQUEST_COUNT_KEY)
+  _ping_infos.https_reqs     = get_counter(HTTPS_REQUEST_COUNT_KEY)
+  _ping_infos.h2c_reqs       = get_counter(H2C_REQUEST_COUNT_KEY)
+  _ping_infos.h2_reqs        = get_counter(H2_REQUEST_COUNT_KEY)
+  _ping_infos.grpc_reqs      = get_counter(GRPC_REQUEST_COUNT_KEY)
+  _ping_infos.grpcs_reqs     = get_counter(GRPCS_REQUEST_COUNT_KEY)
+  _ping_infos.ws_reqs        = get_counter(WS_REQUEST_COUNT_KEY)
+  _ping_infos.wss_reqs       = get_counter(WSS_REQUEST_COUNT_KEY)
+  _ping_infos.go_plugin_reqs = get_counter(GO_PLUGINS_REQUEST_COUNT_KEY)
+
+  send_report("ping", _ping_infos, host, port)
+
+  reset_counter(REQUEST_COUNT_KEY,       _ping_infos.requests)
+  reset_counter(HTTP_REQUEST_COUNT_KEY,  _ping_infos.http_reqs)
+  reset_counter(HTTPS_REQUEST_COUNT_KEY, _ping_infos.https_reqs)
+  reset_counter(H2C_REQUEST_COUNT_KEY,   _ping_infos.h2c_reqs)
+  reset_counter(H2_REQUEST_COUNT_KEY,    _ping_infos.h2_reqs)
+  reset_counter(GRPC_REQUEST_COUNT_KEY,  _ping_infos.grpc_reqs)
+  reset_counter(GRPCS_REQUEST_COUNT_KEY, _ping_infos.grpcs_reqs)
+  reset_counter(WS_REQUEST_COUNT_KEY,    _ping_infos.ws_reqs)
+  reset_counter(WSS_REQUEST_COUNT_KEY,   _ping_infos.wss_reqs)
+  reset_counter(GO_PLUGINS_REQUEST_COUNT_KEY, _ping_infos.go_plugin_reqs)
+end
+
 
 local function ping_handler(premature)
   if premature then
@@ -163,22 +311,7 @@ local function ping_handler(premature)
     return
   end
 
-  local n_requests, err = kong_dict:get(BUFFERED_REQUESTS_COUNT_KEYS)
-  if err then
-    log(WARN, "could not get buffered requests count from 'kong' shm: ", err)
-  elseif not n_requests then
-    n_requests = 0
-  end
-
-  _ping_infos.requests = n_requests
-  _ping_infos.unique_id = _unique_str
-
-  send_report("ping", _ping_infos)
-
-  local ok, err = kong_dict:incr(BUFFERED_REQUESTS_COUNT_KEYS, -n_requests, n_requests)
-  if not ok then
-    log(WARN, "could not reset buffered requests count in 'kong' shm: ", err)
-  end
+  send_ping()
 end
 
 
@@ -202,27 +335,10 @@ local function configure_ping(kong_conf)
   end
 
   add_immutable_value("database", kong_conf.database)
+  add_immutable_value("role", kong_conf.role)
   add_immutable_value("_admin", #kong_conf.admin_listeners > 0 and 1 or 0)
   add_immutable_value("_proxy", #kong_conf.proxy_listeners > 0 and 1 or 0)
   add_immutable_value("_stream", #kong_conf.stream_listeners > 0 and 1 or 0)
-  add_immutable_value("_orig", #kong_conf.origins > 0 and 1 or 0)
-
-  local _tip = 0
-
-  for _, property in ipairs({ "proxy_listeners", "stream_listeners" }) do
-    if _tip == 1 then
-      break
-    end
-
-    for i = 1, #kong_conf[property] or {} do
-      if kong_conf[property][i].transparent then
-        _tip = 1
-        break
-      end
-    end
-  end
-
-  add_immutable_value("_tip", _tip)
 end
 
 
@@ -231,8 +347,6 @@ local retrieve_redis_version
 
 do
   local _retrieved_redis_version = false
-
-
   retrieve_redis_version = function(red)
     if not _enabled or _retrieved_redis_version then
       return
@@ -270,6 +384,11 @@ return {
     end
 
     create_timer(PING_INTERVAL, ping_handler)
+
+    local err = create_counter()
+    if err then
+      error(err)
+    end
   end,
   add_immutable_value = add_immutable_value,
   configure_ping = configure_ping,
@@ -277,18 +396,25 @@ return {
   get_ping_value = function(k)
     return _ping_infos[k]
   end,
-  send_ping = function(host, port)
-    send_report("ping", _ping_infos, host, port)
-  end,
-  log = function()
+  send_ping = send_ping,
+  log = function(ctx)
     if not _enabled then
       return
     end
 
-    local ok, err = kong_dict:incr(BUFFERED_REQUESTS_COUNT_KEYS, 1, 0)
-    if not ok then
-      log(WARN, "could not increment buffered requests count in 'kong' shm: ",
-                err)
+    local count_key = subsystem == "stream" and STREAM_COUNT_KEY
+                                             or REQUEST_COUNT_KEY
+
+    incr_counter(count_key)
+    local suffix, err = get_current_suffix()
+    if suffix then
+      incr_counter(count_key .. ":" .. suffix)
+
+      if ctx.ran_go_plugin then
+        incr_counter(GO_PLUGINS_REQUEST_COUNT_KEY)
+      end
+    else
+      log(WARN, err)
     end
   end,
 
@@ -298,4 +424,8 @@ return {
   end,
   send = send_report,
   retrieve_redis_version = retrieve_redis_version,
+  -- exposed for unit test
+  _create_counter = create_counter,
+  -- exposed for integration test
+  _sync_counter = function() report_counter:sync() end,
 }

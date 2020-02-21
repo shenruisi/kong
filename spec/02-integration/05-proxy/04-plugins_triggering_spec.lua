@@ -18,7 +18,6 @@ for _, strategy in helpers.each_strategy() do
 
     lazy_setup(function()
       bp, db = helpers.get_db_utils(strategy, {
-        "apis",
         "routes",
         "services",
         "plugins",
@@ -27,7 +26,6 @@ for _, strategy in helpers.each_strategy() do
       }, {
         "error-handler-log",
         "short-circuit",
-        "short-circuit-last",
         "error-generator",
       })
 
@@ -72,6 +70,7 @@ for _, strategy in helpers.each_strategy() do
       bp.plugins:insert {
         name   = "rate-limiting",
         config = {
+          policy = "local",
           hour = 1,
         },
       }
@@ -92,6 +91,7 @@ for _, strategy in helpers.each_strategy() do
         route   = { id = route1.id },
         service = { id = service2.id },
         config  = {
+          policy = "local",
           hour  = 2,
         },
       }
@@ -101,6 +101,7 @@ for _, strategy in helpers.each_strategy() do
         name     = "rate-limiting",
         consumer = { id = consumer2.id },
         config   = {
+          policy = "local",
           hour   = 3,
         },
       }
@@ -121,6 +122,7 @@ for _, strategy in helpers.each_strategy() do
         route    = { id = route2.id },
         consumer = { id = consumer2.id },
         config   = {
+          policy = "local",
           hour   = 4,
         },
       }
@@ -151,6 +153,7 @@ for _, strategy in helpers.each_strategy() do
         service  = { id = service4.id },
         consumer = { id = consumer3.id },
         config   = {
+          policy = "local",
           hour   = 5,
         }
       }
@@ -165,7 +168,7 @@ for _, strategy in helpers.each_strategy() do
 
     lazy_teardown(function()
       if proxy_client then proxy_client:close() end
-      helpers.stop_kong()
+      helpers.stop_kong(nil, true)
     end)
 
     it("checks global configuration without credentials", function()
@@ -235,7 +238,7 @@ for _, strategy in helpers.each_strategy() do
           proxy_client:close()
         end
 
-        helpers.stop_kong()
+        helpers.stop_kong(nil, true)
         db:truncate("routes")
         db:truncate("services")
         db:truncate("consumers")
@@ -249,20 +252,20 @@ for _, strategy in helpers.each_strategy() do
             port = helpers.mock_upstream_port,
           }
 
-          local route = assert(db.routes:insert {
+          local route = assert(bp.routes:insert {
             hosts     = { "mock_upstream" },
             protocols = { "http" },
             service   = service,
           })
 
           -- plugin able to short-circuit a request
-          assert(db.plugins:insert {
+          assert(bp.plugins:insert {
             name  = "key-auth",
             route = { id = route.id },
           })
 
           -- response/body filter plugin
-          assert(db.plugins:insert {
+          assert(bp.plugins:insert {
             name   = "dummy",
             route  = { id = route.id },
             config = {
@@ -271,7 +274,7 @@ for _, strategy in helpers.each_strategy() do
           })
 
           -- log phase plugin
-          assert(db.plugins:insert {
+          assert(bp.plugins:insert {
             name   = "file-log",
             route  = { id = route.id },
             config = {
@@ -288,14 +291,14 @@ for _, strategy in helpers.each_strategy() do
           }
 
           -- route that will produce an error
-          local route = assert(db.routes:insert {
+          local route = assert(bp.routes:insert {
             hosts = { "mock_upstream_err" },
             protocols = { "http" },
             service = service,
           })
 
           -- plugin that produces an error
-          assert(db.plugins:insert {
+          assert(bp.plugins:insert {
             name   = "dummy",
             route  = { id = route.id },
             config = {
@@ -304,7 +307,7 @@ for _, strategy in helpers.each_strategy() do
           })
 
           -- log phase plugin
-          assert(db.plugins:insert {
+          assert(bp.plugins:insert {
             name   = "file-log",
             route  = { id = route.id },
             config = {
@@ -328,7 +331,7 @@ for _, strategy in helpers.each_strategy() do
 
         os.remove(FILE_LOG_PATH)
 
-        helpers.stop_kong()
+        helpers.stop_kong(nil, true)
       end)
 
       after_each(function()
@@ -452,7 +455,7 @@ for _, strategy in helpers.each_strategy() do
           proxy_client:close()
         end
 
-        helpers.stop_kong()
+        helpers.stop_kong(nil, true)
 
         db:truncate("routes")
         db:truncate("services")
@@ -488,7 +491,7 @@ for _, strategy in helpers.each_strategy() do
         assert(helpers.start_kong {
           database          = strategy,
           nginx_conf        = "spec/fixtures/custom_nginx.template",
-          anonymous_reports = true,
+          --anonymous_reports = true,
         })
 
         proxy_client = helpers.proxy_client()
@@ -499,7 +502,7 @@ for _, strategy in helpers.each_strategy() do
           proxy_client:close()
         end
 
-        helpers.stop_kong()
+        helpers.stop_kong(nil, true)
       end)
 
       it("runs without causing an internal error", function()
@@ -583,21 +586,21 @@ for _, strategy in helpers.each_strategy() do
 
         do
           -- service to mock HTTP 504
-          local httpbin_service = bp.services:insert {
+          local blackhole_service = bp.services:insert {
             name            = "timeout",
-            host            = "httpbin.org",
+            host            = helpers.blackhole_host,
             connect_timeout = 1, -- ms
           }
 
           bp.routes:insert {
             hosts     = { "connect_timeout" },
             protocols = { "http" },
-            service   = httpbin_service,
+            service   = blackhole_service,
           }
 
           bp.plugins:insert {
             name     = "file-log",
-            service  = { id = httpbin_service.id },
+            service  = { id = blackhole_service.id },
             config   = {
               path   = FILE_LOG_PATH,
               reopen = true,
@@ -621,6 +624,12 @@ for _, strategy in helpers.each_strategy() do
           }
         end
 
+        -- start Kong instance with our services and plugins
+        assert(helpers.start_kong {
+          database = strategy,
+          -- /!\ test with real nginx config
+        })
+
         -- start mock httpbin instance
         assert(helpers.start_kong {
           database = strategy,
@@ -631,18 +640,12 @@ for _, strategy in helpers.each_strategy() do
           prefix = "servroot2",
           nginx_conf = "spec/fixtures/custom_nginx.template",
         })
-
-        -- start Kong instance with our services and plugins
-        assert(helpers.start_kong {
-          database = strategy,
-          -- /!\ test with real nginx config
-        })
       end)
 
 
       lazy_teardown(function()
         helpers.stop_kong("servroot2")
-        helpers.stop_kong()
+        helpers.stop_kong(nil, true)
       end)
 
 
@@ -689,9 +692,7 @@ for _, strategy in helpers.each_strategy() do
       end)
 
 
-      pending("log plugins sees same request in error_page handler (HTTP 502)", function()
-        -- PENDING: waiting on Nginx error_patch_preserve_method patch
-
+      it("log plugins sees same request in error_page handler (HTTP 502)", function()
         -- triggers error_page directive
         local uuid = utils.uuid()
 
@@ -786,7 +787,7 @@ for _, strategy in helpers.each_strategy() do
       end)
 
 
-      pending("log plugins sees same request in error_page handler (HTTP 504)", function()
+      it("log plugins sees same request in error_page handler (HTTP 504)", function()
         -- triggers error_page directive
         local uuid = utils.uuid()
 
@@ -838,6 +839,10 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(494, res)
 
+        -- close and reopen to flush the request
+        proxy_client:close()
+        proxy_client = helpers.proxy_client()
+
         -- TEST: ensure that our logging plugin was executed and wrote
         -- something to disk.
 
@@ -854,9 +859,7 @@ for _, strategy in helpers.each_strategy() do
       end)
 
 
-      pending("log plugins sees same request in error_page handler (HTTP 494)", function()
-        -- PENDING: waiting on Nginx error_patch_preserve_method patch
-
+      it("log plugins sees same request in error_page handler (HTTP 494)", function()
         -- triggers error_page directive
         local uuid = utils.uuid()
 
@@ -876,6 +879,10 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(494, res)
 
+        -- close and reopen to flush the request
+        proxy_client:close()
+        proxy_client = helpers.proxy_client()
+
         -- TEST: ensure that our logging plugin was executed and wrote
         -- something to disk.
 
@@ -888,9 +895,9 @@ for _, strategy in helpers.each_strategy() do
         local log_message = cjson.decode(pl_stringx.strip(log))
         assert.equal("POST", log_message.request.method)
         assert.equal("bar", log_message.request.querystring.foo)
-        assert.equal("/status/200?foo=bar", log_message.upstream_uri)
+        assert.equal("", log_message.upstream_uri) -- no URI here since Nginx could not parse request
         assert.equal(uuid, log_message.request.headers["x-uuid"])
-        assert.equal("unavailable", log_message.request.headers.host)
+        assert.is_nil(log_message.request.headers.host) -- none as well
       end)
 
 
@@ -908,6 +915,10 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(414, res)
 
+        -- close and reopen to flush the request
+        proxy_client:close()
+        proxy_client = helpers.proxy_client()
+
         -- TEST: ensure that our logging plugin was executed and wrote
         -- something to disk.
 
@@ -924,9 +935,7 @@ for _, strategy in helpers.each_strategy() do
       end)
 
 
-      pending("log plugins sees same request in error_page handler (HTTP 414)", function()
-        -- PENDING: waiting on Nginx error_patch_preserve_method patch
-
+      it("log plugins sees same request in error_page handler (HTTP 414)", function()
         -- triggers error_page directive
         local uuid = utils.uuid()
 
@@ -945,6 +954,10 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(414, res)
 
+        -- close and reopen to flush the request
+        proxy_client:close()
+        proxy_client = helpers.proxy_client()
+
         -- TEST: ensure that our logging plugin was executed and wrote
         -- something to disk.
 
@@ -955,8 +968,6 @@ for _, strategy in helpers.each_strategy() do
 
         local log = pl_file.read(FILE_LOG_PATH)
         local log_message = cjson.decode(pl_stringx.strip(log))
-        local ins = require "inspect"
-        print(ins(log_message))
         assert.equal("POST", log_message.request.method)
         assert.equal("", log_message.upstream_uri) -- no URI here since Nginx could not parse request
         assert.is_nil(log_message.request.headers["x-uuid"]) -- none since Nginx could not parse request
@@ -1005,10 +1016,8 @@ for _, strategy in helpers.each_strategy() do
       end)
     end)
 
-    describe("plugin with run_on", function()
-      describe("(http)", function()
-        local proxy_ssl_client
-
+    describe("plugin's init_worker", function()
+      describe("[pre-configured]", function()
         lazy_setup(function()
           if proxy_client then
             proxy_client:close()
@@ -1020,482 +1029,34 @@ for _, strategy in helpers.each_strategy() do
           db:truncate("services")
           db:truncate("plugins")
 
-          do
-            -- never used as the plugins short-circuit
-            local mock_service = assert(db.services:insert {
-              name = "mock-service",
-              host = helpers.mock_upstream_host,
-              port = helpers.mock_upstream_port,
-            })
+          -- never used as the plugins short-circuit
+          local service = assert(bp.services:insert {
+            name = "mock-service",
+            host = helpers.mock_upstream_host,
+            port = helpers.mock_upstream_port,
+          })
 
-            local receiving_sidecar = assert(db.services:insert {
-              name = "receiving-sidecar",
-              host = helpers.mock_upstream_host,
-              port = 18443,
-              path = "/status/200",
-              protocol = "https",
-            })
+          local route = assert(bp.routes:insert {
+            hosts     = { "runs-init-worker.org" },
+            protocols = { "http" },
+            service   = service,
+          })
 
-            --
-
-            local first_on_first = assert(db.routes:insert {
-              hosts     = { "first-on-first.org" },
-              protocols = { "http" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_first.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = first_on_first.id },
-              config = {
-                status = 503,
-                message = "first-on-first"
-              },
-              run_on = "first",
-            }
-
-            --
-
-            local first_on_first_https = assert(db.routes:insert {
-              hosts     = { "first-on-first-https.org" },
-              protocols = { "https" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_first_https.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = first_on_first_https.id },
-              config = {
-                status = 503,
-                message = "first-on-first-https"
-              },
-              run_on = "first",
-            }
-
-            --
-
-            local first_on_second_a = assert(db.routes:insert {
-              hosts     = { "first-on-second.org" },
-              protocols = { "http" },
-              service   = receiving_sidecar,
-            })
-
-            local first_on_second_b = assert(db.routes:insert {
-              hosts      = { "first-on-second.org" },
-              protocols  = { "https" },
-              paths      = { "/status/200" },
-              strip_path = false,
-              service    = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_second_a.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_second_b.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "first",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = first_on_second_b.id },
-              config = {
-                status = 503,
-                message = "first-on-second"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local first_on_second_a_https = assert(db.routes:insert {
-              hosts     = { "first-on-second-https.org" },
-              protocols = { "https" },
-              service   = receiving_sidecar,
-            })
-
-            local first_on_second_b_https = assert(db.routes:insert {
-              hosts      = { "first-on-second-https.org" },
-              protocols  = { "https" },
-              paths      = { "/status/200" },
-              strip_path = false,
-              service    = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_second_a_https.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_second_b_https.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "first",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = first_on_second_b_https.id },
-              config = {
-                status = 503,
-                message = "first-on-second"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local second_on_second_a = assert(db.routes:insert {
-              hosts     = { "second-on-second.org" },
-              protocols = { "http" },
-              service   = receiving_sidecar,
-            })
-
-            local second_on_second_b = assert(db.routes:insert {
-              hosts      = { "second-on-second.org" },
-              protocols  = { "https" },
-              paths      = { "/status/200" },
-              strip_path = false,
-              service    = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_second_a.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_second_b.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "first",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = second_on_second_b.id },
-              config = {
-                status = 503,
-                message = "second-on-second"
-              },
-              run_on = "second",
-            }
-
-            --
-
-            local second_on_second_a_https = assert(db.routes:insert {
-              hosts     = { "second-on-second-https.org" },
-              protocols = { "https" },
-              service   = receiving_sidecar,
-            })
-
-            local second_on_second_b_https = assert(db.routes:insert {
-              hosts      = { "second-on-second-https.org" },
-              protocols  = { "https" },
-              paths      = { "/status/200" },
-              strip_path = false,
-              service    = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_second_a_https.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_second_b_https.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "first",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = second_on_second_b_https.id },
-              config = {
-                status = 503,
-                message = "second-on-second-https"
-              },
-              run_on = "second",
-            }
-
-            --
-
-            local second_on_first = assert(db.routes:insert {
-              hosts     = { "second-on-first.org" },
-              protocols = { "http" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_first.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = second_on_first.id },
-              config = {
-                status = 503,
-                message = "second-on-first"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local second_on_first_https = assert(db.routes:insert {
-              hosts     = { "second-on-first-https.org" },
-              protocols = { "https" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_first_https.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = second_on_first_https.id },
-              config = {
-                status = 503,
-                message = "second-on-first-https"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local all_on_first = assert(db.routes:insert {
-              hosts     = { "all-on-first.org" },
-              protocols = { "http" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = all_on_first.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_first.id },
-              config = {
-                status = 503,
-                message = "all-on-first"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local all_on_first_https = assert(db.routes:insert {
-              hosts     = { "all-on-first-https.org" },
-              protocols = { "https" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = all_on_first_https.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_first_https.id },
-              config = {
-                status = 503,
-                message = "all-on-first-https"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local all_on_second_a = assert(db.routes:insert {
-              hosts     = { "all-on-second.org" },
-              protocols = { "http" },
-              service   = receiving_sidecar,
-            })
-
-            local all_on_second_b = assert(db.routes:insert {
-              hosts      = { "all-on-second.org" },
-              protocols  = { "https" },
-              paths      = { "/status/200" },
-              strip_path = false,
-              service    = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_second_a.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_second_b.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "first",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = all_on_second_b.id },
-              config = {
-                status = 503,
-                message = "all-on-second"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local all_on_second_a_https = assert(db.routes:insert {
-              hosts     = { "all-on-second-https.org" },
-              protocols = { "http" },
-              service   = receiving_sidecar,
-            })
-
-            local all_on_second_b_https = assert(db.routes:insert {
-              hosts      = { "all-on-second-https.org" },
-              protocols  = { "https" },
-              paths      = { "/status/200" },
-              strip_path = false,
-              service    = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_second_a_https.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_second_b_https.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "first",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = all_on_second_b_https.id },
-              config = {
-                status = 503,
-                message = "all-on-second-https"
-              },
-              run_on = "all",
-            }
-          end
+          bp.plugins:insert {
+            name = "short-circuit",
+            route = { id = route.id },
+            config = {
+              status = 200,
+              message = "plugin executed"
+            },
+          }
 
           assert(helpers.start_kong {
-            prefix       = "servroot1",
-            database     = strategy,
+            database   = strategy,
             nginx_conf = "spec/fixtures/custom_nginx.template",
           })
 
-          assert(helpers.start_kong {
-            prefix       = "servroot2",
-            database     = strategy,
-            proxy_listen = "0.0.0.0:18000, 0.0.0.0:18443 ssl",
-            admin_listen = "off",
-          })
-
           proxy_client = helpers.proxy_client()
-          proxy_ssl_client = helpers.proxy_ssl_client()
         end)
 
         lazy_teardown(function()
@@ -1503,876 +1064,112 @@ for _, strategy in helpers.each_strategy() do
             proxy_client:close()
           end
 
-          if proxy_ssl_client then
-            proxy_ssl_client:close()
-          end
-
-          helpers.stop_kong("servroot1", true)
-          helpers.stop_kong("servroot2", true)
+          helpers.stop_kong(nil, true)
         end)
 
-        it("= 'first' does get executed when running on first", function()
-          local res = assert(proxy_client:get("/status/200", {
+        it("is executed", function()
+          local res = assert(proxy_client:get("/status/400", {
             headers = {
-              ["Host"] = "first-on-first.org",
+              ["Host"] = "runs-init-worker.org",
             }
           }))
 
-          local body = assert.res_status(503, res)
+          assert.equal("true", res.headers["Kong-Init-Worker-Called"])
+
+          local body = assert.res_status(200, res)
           local json = cjson.decode(body)
 
           assert.same({
-            status  = 503,
-            message = "first-on-first"
-          }, json)
-        end)
-
-        it("= 'first' does get executed when running on first (https)", function()
-          local res = assert(proxy_ssl_client:get("/status/200", {
-            headers = {
-              ["Host"] = "first-on-first-https.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "first-on-first-https"
-          }, json)
-        end)
-
-        it("= 'first' does not get executed when running on second", function()
-          local res = assert(proxy_client:get("/", {
-            headers = {
-              ["Host"] = "first-on-second.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "first-on-second"
-          }, json)
-        end)
-
-        it("= 'first' does not get executed when running on second (https)", function()
-          local res = assert(proxy_ssl_client:get("/", {
-            headers = {
-              ["Host"] = "first-on-second-https.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "first-on-second"
-          }, json)
-        end)
-
-        it("= 'second' does get executed when running on second", function()
-          local res = assert(proxy_client:get("/", {
-            headers = {
-              ["Host"] = "second-on-second.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "second-on-second"
-          }, json)
-        end)
-
-        it("= 'second' does get executed when running on second (https)", function()
-          local res = assert(proxy_ssl_client:get("/", {
-            headers = {
-              ["Host"] = "second-on-second-https.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "second-on-second-https"
-          }, json)
-        end)
-
-        it("= 'second' does not get executed when running on first", function()
-          local res = assert(proxy_client:get("/status/200", {
-            headers = {
-              ["Host"] = "second-on-first.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "second-on-first"
-          }, json)
-        end)
-
-        it("= 'second' does not get executed when running on first (https)", function()
-          local res = assert(proxy_ssl_client:get("/status/200", {
-            headers = {
-              ["Host"] = "second-on-first-https.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "second-on-first-https"
-          }, json)
-        end)
-
-        it("= 'all' does get executed when running on first", function()
-          local res = assert(proxy_client:get("/status/200", {
-            headers = {
-              ["Host"] = "all-on-first.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "all-on-first"
-          }, json)
-        end)
-
-        it("= 'all' does get executed when running on first (https)", function()
-          local res = assert(proxy_ssl_client:get("/status/200", {
-            headers = {
-              ["Host"] = "all-on-first-https.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "all-on-first-https"
-          }, json)
-        end)
-
-        it("= 'all' does get executed when running on second", function()
-          local res = assert(proxy_client:get("/", {
-            headers = {
-              ["Host"] = "all-on-second.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "all-on-second"
-          }, json)
-        end)
-
-        it("= 'all' does get executed when running on second (https)", function()
-          local res = assert(proxy_ssl_client:get("/", {
-            headers = {
-              ["Host"] = "all-on-second-https.org",
-            }
-          }))
-
-          local body = assert.res_status(503, res)
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "all-on-second-https"
+            status  = 200,
+            message = "plugin executed"
           }, json)
         end)
       end)
 
-      describe("(stream)", function()
-        lazy_setup(function()
-          helpers.stop_kong()
+      if strategy ~= "off" then
+        describe("[runtime-configured]", function()
+          local admin_client
+          local route
 
-          db:truncate("routes")
-          db:truncate("services")
-          db:truncate("plugins")
+          lazy_setup(function()
+            if proxy_client then
+              proxy_client:close()
+            end
 
-          do
+            helpers.stop_kong()
+
+            db:truncate("routes")
+            db:truncate("services")
+            db:truncate("plugins")
+
             -- never used as the plugins short-circuit
-            local mock_service = assert(db.services:insert {
+            local service = assert(bp.services:insert {
               name = "mock-service",
-              protocol = "tcp",
               host = helpers.mock_upstream_host,
               port = helpers.mock_upstream_port,
             })
 
-            --
-
-            local first_on_first = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18003
-                }
-              },
-              protocols = { "tcp" },
-              service   = mock_service,
+            route = assert(bp.routes:insert {
+              hosts     = { "runs-init-worker.org" },
+              protocols = { "http" },
+              service   = service,
             })
 
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_first.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = first_on_first.id },
-              config = {
-                status = 503,
-                message = "first-on-first"
-              },
-              run_on = "first",
-            }
-
-            --
-
-            local first_on_first_tls = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18443
-                }
-              },
-              protocols = { "tls" },
-              service   = mock_service,
+            assert(helpers.start_kong {
+              database   = strategy,
+              nginx_conf = "spec/fixtures/custom_nginx.template",
             })
 
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_first_tls.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
+            proxy_client = helpers.proxy_client()
+            admin_client = helpers.admin_client()
+          end)
+
+          lazy_teardown(function()
+            if proxy_client then
+              proxy_client:close()
+            end
+
+            if admin_client then
+              admin_client:close()
+            end
+
+            helpers.stop_kong(nil, true)
+          end)
+
+          it("is executed", function()
+            local res = assert(admin_client:post("/plugins", {
+              headers = {
+                ["Content-Type"] = "application/json"
               },
-              run_on = "second",
-            }
+              body = {
+                name = "short-circuit",
+                route = { id = route.id },
+                config = {
+                  status = 200,
+                  message = "plugin executed"
+                },
+              }
+            }))
 
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = first_on_first_tls.id },
-              config = {
-                status = 503,
-                message = "first-on-first-tls"
-              },
-              run_on = "first",
-            }
+            assert.res_status(201, res)
 
-            --
+            local res = assert(proxy_client:get("/status/400", {
+              headers = {
+                ["Host"] = "runs-init-worker.org",
+              }
+            }))
 
-            local receiving_sidecar_a = assert(db.services:insert {
-              name = "receiving-sidecar-a",
-              host = helpers.mock_upstream_host,
-              port = 19444,
-              protocol = "tls",
-            })
+            assert.equal("true", res.headers["Kong-Init-Worker-Called"])
 
-            local first_on_second_a = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18004
-                }
-              },
-              protocols = { "tcp" },
-              service   = receiving_sidecar_a,
-            })
-
-            local first_on_second_b = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 19444
-                }
-              },
-              protocols = { "tls" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_second_a.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_second_b.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "first",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = first_on_second_b.id },
-              config = {
-                status = 503,
-                message = "first-on-second"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local first_on_second_tls = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18444
-                }
-              },
-              protocols = { "tls" },
-              service   = receiving_sidecar_a,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = first_on_second_tls.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            --
-
-            local receiving_sidecar_b = assert(db.services:insert {
-              name = "receiving-sidecar-b",
-              host = helpers.mock_upstream_host,
-              port = 19445,
-              protocol = "tls",
-            })
-
-            local second_on_second_a = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18005
-                }
-              },
-              protocols = { "tcp" },
-              service   = receiving_sidecar_b,
-            })
-
-            local second_on_second_b = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 19445
-                }
-              },
-              protocols = { "tls" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_second_a.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_second_b.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "first",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = second_on_second_b.id },
-              config = {
-                status = 503,
-                message = "second-on-second"
-              },
-              run_on = "second",
-            }
-
-            --
-
-            local second_on_second_tls = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18445
-                }
-              },
-              protocols = { "tls" },
-              service   = receiving_sidecar_b,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_second_tls.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            --
-
-            local second_on_first = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18006
-                }
-              },
-              protocols = { "tcp" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_first.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = second_on_first.id },
-              config = {
-                status = 503,
-                message = "second-on-first"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local second_on_first_tls = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18446
-                }
-              },
-              protocols = { "tls" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = second_on_first_tls.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = second_on_first_tls.id },
-              config = {
-                status = 503,
-                message = "second-on-first-tls"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local all_on_first = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18007
-                }
-              },
-              protocols = { "tcp" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_first.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = all_on_first.id },
-              config = {
-                status = 503,
-                message = "all-on-first"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local all_on_first = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18447
-                }
-              },
-              protocols = { "tls" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_first.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = all_on_first.id },
-              config = {
-                status = 503,
-                message = "all-on-first-tls"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local receiving_sidecar_c = assert(db.services:insert {
-              name = "receiving-sidecar-c",
-              host = helpers.mock_upstream_host,
-              port = 19448,
-              protocol = "tls",
-            })
-
-            local all_on_second_a = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18008
-                }
-              },
-              protocols = { "tcp" },
-              service   = receiving_sidecar_c,
-            })
-
-            local all_on_second_b = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 19448
-                }
-              },
-              protocols = { "tls" },
-              service   = mock_service,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_second_a.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_second_b.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "first",
-            }
-
-            bp.plugins:insert {
-              name = "short-circuit-last",
-              route = { id = all_on_second_b.id },
-              config = {
-                status = 503,
-                message = "all-on-second"
-              },
-              run_on = "all",
-            }
-
-            --
-
-            local all_on_second_tls = assert(db.routes:insert {
-              destinations = {
-                {
-                  port = 18448
-                }
-              },
-              protocols = { "tls" },
-              service   = receiving_sidecar_c,
-            })
-
-            bp.plugins:insert {
-              name = "short-circuit",
-              route = { id = all_on_second_tls.id },
-              config = {
-                status = 500,
-                message = "should not be executed"
-              },
-              run_on = "second",
-            }
-          end
-
-          assert(helpers.start_kong {
-            prefix        = "servroot1",
-            database      = strategy,
-            stream_listen = "0.0.0.0:18003,0.0.0.0:18443,0.0.0.0:18004,0.0.0.0:18444," ..
-                            "0.0.0.0:18005,0.0.0.0:18445,0.0.0.0:18006,0.0.0.0:18446," ..
-                            "0.0.0.0:18007,0.0.0.0:18447,0.0.0.0:18008,0.0.0.0:18448",
-            proxy_listen  = "off",
-            admin_listen  = "off",
-          })
-
-          assert(helpers.start_kong {
-            prefix        = "servroot2",
-            database      = strategy,
-            stream_listen = "0.0.0.0:19444,0.0.0.0:19445,0.0.0.0:19448",
-            proxy_listen  = "off",
-            admin_listen  = "off",
-          })
+            local body = assert.res_status(200, res)
+            local json = cjson.decode(body)
+            assert.same({
+              status  = 200,
+              message = "plugin executed"
+            }, json)
+          end)
         end)
-
-        lazy_teardown(function()
-          helpers.stop_kong("servroot1", true)
-          helpers.stop_kong("servroot2", true)
-        end)
-
-        it("= 'first' does get executed when running on first", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18003))
-
-          -- TODO: we need to get rid of the next line!
-          assert(tcp:send("this is just for the stream preread as it needs some data or otherwise it just hangs."))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "first-on-first"
-          }, json)
-        end)
-
-        it("= 'first' does get executed when running on first (tls)", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18443))
-
-          -- TODO: should SNI really be mandatory?
-          assert(tcp:sslhandshake(false, "first-on-first.org"))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "first-on-first-tls"
-          }, json)
-        end)
-
-        it("= 'first' does not get executed when running on second", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18004))
-
-          -- TODO: we need to get rid of the next line!
-          assert(tcp:send("this is just for the stream preread as it needs some data or otherwise it just hangs."))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "first-on-second"
-          }, json)
-        end)
-
-        it("= 'first' does not get executed when running on second (tls)", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18444))
-
-          -- TODO: should SNI really be mandatory?
-          assert(tcp:sslhandshake(false, "first-on-second.org"))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "first-on-second"
-          }, json)
-        end)
-
-        it("= 'second' does get executed when running on second", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18005))
-
-          -- TODO: we need to get rid of the next line!
-          assert(tcp:send("this is just for the stream preread as it needs some data or otherwise it just hangs."))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "second-on-second"
-          }, json)
-        end)
-
-        it("= 'second' does get executed when running on second (tls)", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18445))
-
-          -- TODO: should SNI really be mandatory?
-          assert(tcp:sslhandshake(false, "second-on-second.org"))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "second-on-second"
-          }, json)
-        end)
-
-        it("= 'second' does not get executed when running on first", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18006))
-
-          --TODO: we need to get rid of the next line!
-          assert(tcp:send("this is just for the stream preread as it needs some data or otherwise it just hangs."))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "second-on-first"
-          }, json)
-        end)
-
-        it("= 'second' does not get executed when running on first (tls)", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18446))
-
-          -- TODO: should SNI really be mandatory?
-          assert(tcp:sslhandshake(false, "second-on-first.org"))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "second-on-first-tls"
-          }, json)
-        end)
-
-        it("= 'all' does get executed when running on first", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18007))
-
-          -- TODO: we need to get rid of the next line!
-          assert(tcp:send("this is just for the stream preread as it needs some data or otherwise it just hangs."))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "all-on-first"
-          }, json)
-        end)
-
-        it("= 'all' does get executed when running on first (tls)", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18447))
-
-          -- TODO: should SNI really be mandatory?
-          assert(tcp:sslhandshake(false, "all-on-first.org"))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "all-on-first-tls"
-          }, json)
-        end)
-
-        it("= 'all' does get executed when running on second", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18008))
-
-          -- TODO: we need to get rid of the next line!
-          assert(tcp:send("this is just for the stream preread as it needs some data or otherwise it just hangs."))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "all-on-second"
-          }, json)
-        end)
-
-        it("= 'all' does get executed when running on second (tls)", function()
-          local tcp = ngx.socket.tcp()
-          assert(tcp:connect("127.0.0.1", 18448))
-
-          -- TODO: should SNI really be mandatory?
-          assert(tcp:sslhandshake(false, "all-on-second.org"))
-
-          local body = assert(tcp:receive("*a"))
-          local json = cjson.decode(body)
-
-          assert.same({
-            status  = 503,
-            message = "all-on-second"
-          }, json)
-        end)
-      end)
+      end
     end)
   end)
 end

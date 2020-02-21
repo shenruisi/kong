@@ -2,19 +2,32 @@ local utils = require "kong.tools.utils"
 local singletons = require "kong.singletons"
 local conf_loader = require "kong.conf_loader"
 local cjson = require "cjson"
+local api_helpers = require "kong.api.api_helpers"
+local Schema = require "kong.db.schema"
+local Errors = require "kong.db.errors"
 
 local sub = string.sub
-local find = string.find
-local select = select
-local tonumber = tonumber
 local kong = kong
 local knode  = (kong and kong.node) and kong.node or
                require "kong.pdk.node".new()
+local errors = Errors.new()
 
 
 local tagline = "Welcome to " .. _KONG._NAME
 local version = _KONG._VERSION
 local lua_version = jit and jit.version or _VERSION
+
+
+local strip_foreign_schemas = function(fields)
+  for _, field in ipairs(fields) do
+    local fname = next(field)
+    local fdata = field[fname]
+    if fdata["type"] == "foreign" then
+      fdata.schema = nil
+    end
+  end
+end
+
 
 return {
   ["/"] = {
@@ -24,7 +37,7 @@ return {
 
       do
         local set = {}
-        for row, err in kong.db.plugins:each(1000) do
+        for row, err in kong.db.plugins:each() do
           if err then
             kong.log.err(err)
             return kong.response.exit(500, { message = "An unexpected error happened" })
@@ -79,44 +92,80 @@ return {
       })
     end
   },
-  ["/status"] = {
+  ["/endpoints"] = {
     GET = function(self, dao, helpers)
-      local r = ngx.location.capture "/nginx_status"
-      if r.status ~= 200 then
-        kong.log.err(r.body)
-        return kong.response.exit(500, { message = "An unexpected error happened" })
+      local endpoints = setmetatable({}, cjson.array_mt)
+      local lapis_endpoints = require("kong.api").ordered_routes
+
+      for k, v in pairs(lapis_endpoints) do
+        if type(k) == "string" then -- skip numeric indices
+          endpoints[#endpoints + 1] = k:gsub(":([^/:]+)", function(m)
+              return "{" .. m .. "}"
+            end)
+        end
       end
+      table.sort(endpoints, function(a, b)
+        -- when sorting use lower-ascii char for "/" to enable segment based
+        -- sorting, so not this:
+        --   /a
+        --   /ab
+        --   /ab/a
+        --   /a/z
+        -- But this:
+        --   /a
+        --   /a/z
+        --   /ab
+        --   /ab/a
+        return a:gsub("/", "\x00") < b:gsub("/", "\x00")
+      end)
 
-      local var = ngx.var
-      local accepted, handled, total = select(3, find(r.body, "accepts handled requests\n (%d*) (%d*) (%d*)"))
-
-      local status_response = {
-        server = {
-          connections_active = tonumber(var.connections_active),
-          connections_reading = tonumber(var.connections_reading),
-          connections_writing = tonumber(var.connections_writing),
-          connections_waiting = tonumber(var.connections_waiting),
-          connections_accepted = tonumber(accepted),
-          connections_handled = tonumber(handled),
-          total_requests = tonumber(total)
-        },
-        database = {
-          reachable = true,
-        },
-      }
-
-      -- TODO: no way to bypass connection pool
-      local ok, err = kong.db:connect()
-      if not ok then
-        ngx.log(ngx.ERR, "failed to connect to ", kong.db.infos.strategy,
-                         " during /status endpoint check: ", err)
-        status_response.database.reachable = false
-      end
-
-      -- ignore error
-      kong.db:close()
-
-      return kong.response.exit(200, status_response)
+      return kong.response.exit(200, { data = endpoints })
     end
-  }
+  },
+  ["/schemas/:name"] = {
+    GET = function(self, db, helpers)
+      local entity = kong.db[self.params.name]
+      local schema = entity and entity.schema or nil
+      if not schema then
+        return kong.response.exit(404, { message = "No entity named '"
+                                      .. self.params.name .. "'" })
+      end
+      local copy = api_helpers.schema_to_jsonable(schema)
+      strip_foreign_schemas(copy.fields)
+      return kong.response.exit(200, copy)
+    end
+  },
+  ["/schemas/:db_entity_name/validate"] = {
+    POST = function(self, db, helpers)
+      local db_entity_name = self.params.db_entity_name
+      -- What happens when db_entity_name is a field name in the schema?
+      self.params.db_entity_name = nil
+      local entity = kong.db[db_entity_name]
+      local schema = entity and entity.schema or nil
+      if not schema then
+        return kong.response.exit(404, { message = "No entity named '"
+                                  .. db_entity_name .. "'" })
+      end
+      local schema = assert(Schema.new(schema))
+      local _, err_t = schema:validate(schema:process_auto_fields(
+                                        self.params, "insert"))
+      if err_t then
+        return kong.response.exit(400, errors:schema_violation(err_t))
+      end
+      return kong.response.exit(200, { message = "schema validation successful" })
+    end
+  },
+  ["/schemas/plugins/:name"] = {
+    GET = function(self, db, helpers)
+      local subschema = kong.db.plugins.schema.subschemas[self.params.name]
+      if not subschema then
+        return kong.response.exit(404, { message = "No plugin named '"
+                                  .. self.params.name .. "'" })
+      end
+
+      local copy = api_helpers.schema_to_jsonable(subschema)
+      strip_foreign_schemas(copy.fields)
+      return kong.response.exit(200, copy)
+    end
+  },
 }

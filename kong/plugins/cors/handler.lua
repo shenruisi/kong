@@ -1,4 +1,3 @@
-local BasePlugin = require "kong.plugins.base_plugin"
 local lrucache   = require "resty.lrucache"
 local url        = require "socket.url"
 
@@ -14,11 +13,11 @@ local ipairs   = ipairs
 local HTTP_OK = 200
 
 
-local CorsHandler = BasePlugin:extend()
+local CorsHandler = {}
 
 
 CorsHandler.PRIORITY = 2000
-CorsHandler.VERSION = "1.0.0"
+CorsHandler.VERSION = "2.0.0"
 
 
 -- per-plugin cache of normalized origins for runtime comparison
@@ -154,6 +153,7 @@ local function configure_origin(conf)
     end
   end
 
+  kong.response.clear_header("Access-Control-Allow-Origin")
   return false
 end
 
@@ -181,15 +181,11 @@ local function configure_credentials(conf, allow_all)
 end
 
 
-function CorsHandler:new()
-  CorsHandler.super.new(self, "cors")
-end
-
-
 function CorsHandler:access(conf)
-  CorsHandler.super.access(self)
-
-  if kong.request.get_method() ~= "OPTIONS" then
+  if kong.request.get_method() ~= "OPTIONS"
+     or not kong.request.get_header("Origin")
+     or not kong.request.get_header("Access-Control-Request-Method")
+  then
     return
   end
 
@@ -220,7 +216,8 @@ function CorsHandler:access(conf)
   end
 
   local methods = conf.methods and concat(conf.methods, ",")
-                  or "GET,HEAD,PUT,PATCH,POST,DELETE"
+                  or "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS,TRACE,CONNECT"
+
   set_header("Access-Control-Allow-Methods", methods)
 
   if conf.max_age then
@@ -232,8 +229,6 @@ end
 
 
 function CorsHandler:header_filter(conf)
-  CorsHandler.super.header_filter(self)
-
   if kong.ctx.plugin.skip_response_headers then
     return
   end

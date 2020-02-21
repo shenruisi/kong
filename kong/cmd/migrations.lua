@@ -1,6 +1,7 @@
 local DB = require "kong.db"
 local log = require "kong.cmd.utils.log"
 local tty = require "kong.cmd.utils.tty"
+local meta = require "kong.meta"
 local conf_loader = require "kong.conf_loader"
 local kong_global = require "kong.global"
 local migrations_utils = require "kong.cmd.utils.migrations"
@@ -42,6 +43,7 @@ Options:
                                     migrations.
 
  -c,--conf        (optional string) Configuration file.
+
 ]]
 
 
@@ -79,6 +81,8 @@ local function execute(args)
 
   local conf = assert(conf_loader(args.conf))
 
+  package.path = conf.lua_package_path .. ";" .. package.path
+
   conf.pg_timeout = args.db_timeout -- connect + send + read
 
   conf.cassandra_timeout = args.db_timeout -- connect + send + read
@@ -94,21 +98,50 @@ local function execute(args)
 
   if args.command == "list" then
     if schema_state.needs_bootstrap then
-      log("database needs bootstrapping; run 'kong migrations bootstrap'")
+      log(migrations_utils.NEEDS_BOOTSTRAP_MSG)
       os.exit(3)
     end
 
+    local r = ""
+
     if schema_state.executed_migrations then
-      log("executed migrations:\n%s", schema_state.executed_migrations)
+      log("Executed migrations:\n%s", schema_state.executed_migrations)
+      r = "\n"
     end
 
-    migrations_utils.print_state(schema_state)
+    if schema_state.pending_migrations then
+      log("%sPending migrations:\n%s", r, schema_state.pending_migrations)
+      r = "\n"
+    end
+
+    if schema_state.new_migrations then
+      log("%sNew migrations available:\n%s", r, schema_state.new_migrations)
+      r = "\n"
+    end
+
+    if schema_state.pending_migrations and schema_state.new_migrations then
+      if r ~= "" then
+        log("")
+      end
+
+      log.warn("Database has pending migrations from a previous upgrade, " ..
+               "and new migrations from this upgrade (version %s)",
+               tostring(meta._VERSION))
+
+      log("\nRun 'kong migrations finish' when ready to complete pending " ..
+          "migrations (%s %s will be incompatible with the previous Kong " ..
+          "version)", db.strategy, db.infos.db_desc)
+
+      os.exit(4)
+    end
 
     if schema_state.pending_migrations then
+      log("\nRun 'kong migrations finish' when ready")
       os.exit(4)
     end
 
     if schema_state.new_migrations then
+      log("\nRun 'kong migrations up' to proceed")
       os.exit(5)
     end
 

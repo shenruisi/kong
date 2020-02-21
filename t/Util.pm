@@ -7,7 +7,7 @@ use Cwd qw(cwd);
 our $cwd = cwd();
 
 our $HttpConfig = <<_EOC_;
-    lua_package_path \'$cwd/?/init.lua;;\';
+    lua_package_path \'$cwd/?.lua;$cwd/?/init.lua;;\';
 
     init_by_lua_block {
         local log = ngx.log
@@ -23,8 +23,6 @@ our $HttpConfig = <<_EOC_;
             local v = require "jit.v"
             v.on(outfile)
         end
-
-        require "resty.core"
 
         if os.getenv("PDK_PHASE_CHECKS_LUACOV") == "1" then
             require("luacov.runner")("t/phase_checks.luacov")
@@ -76,8 +74,6 @@ our $HttpConfig = <<_EOC_;
                 end
             end
 
-            kong = nil
-
             local entries = {}
             for _, entry in ipairs(phase_check_data) do
                 entries[entry.method] = true
@@ -104,16 +100,22 @@ our $HttpConfig = <<_EOC_;
                             fname .. " expected "
 
                 -- Run function with phase checked disabled
-                kong = nil
+		if kong then
+		  kong.ctx = nil
+		end
+		-- kong = nil
 
                 local expected = fdata[phases[phase]]
+                if expected == "pending" then
+                    goto continue
+                end
 
                 local forced_false = expected == "forced false"
                 if forced_false then
                     expected = true
                 end
 
-                local ok1, err1 = pcall(fn, unpack(fdata.args))
+                local ok1, err1 = pcall(fn, unpack(fdata.args or {}))
 
                 if ok1 ~= expected then
                     local errmsg = ""
@@ -134,7 +136,10 @@ our $HttpConfig = <<_EOC_;
                 end
 
                 -- Re-enable phase checking and compare results
-                kong = { ctx = { core = { phase = phase } } }
+		if not kong then
+		  kong = {}
+		end
+                kong.ctx = { core = { phase = phase } }
 
                 if forced_false then
                     ok1, err1 = false, ""
@@ -142,7 +147,7 @@ our $HttpConfig = <<_EOC_;
                 end
 
                 ---[[
-                local ok2, err2 = pcall(fn, unpack(fdata.args))
+                local ok2, err2 = pcall(fn, unpack(fdata.args or {}))
 
                 if ok1 then
                     -- succeeded without phase checking,

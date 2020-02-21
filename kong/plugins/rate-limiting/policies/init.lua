@@ -59,13 +59,14 @@ local EXPIRATIONS = {
 
 
 return {
+  ["EXPIRATIONS"] = EXPIRATIONS,
   ["local"] = {
     increment = function(conf, limits, identifier, current_timestamp, value)
       local periods = timestamp.get_timestamps(current_timestamp)
       for period, period_date in pairs(periods) do
         if limits[period] then
           local cache_key = get_local_key(conf, identifier, period, period_date)
-          local newval, err = shm:incr(cache_key, value, 0)
+          local newval, err = shm:incr(cache_key, value, 0, EXPIRATIONS[period])
           if not newval then
             kong.log.err("could not increment counter for period '", period, "': ", err)
             return nil, err

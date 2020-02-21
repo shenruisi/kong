@@ -11,7 +11,7 @@ describe("Proxy error handlers", function()
   end)
 
   lazy_teardown(function()
-    helpers.stop_kong()
+    helpers.stop_kong(nil, true)
   end)
 
   before_each(function()
@@ -35,6 +35,18 @@ describe("Proxy error handlers", function()
     assert.res_status(494, res)
     local body = res:read_body()
     assert.matches("kong/", res.headers.server, nil, true)
-    assert.equal("Request Header Or Cookie Too Large\n", body)
+    assert.equal("Request header or cookie too large\n", body)
+  end)
+
+  it("does not expose OpenResty version", function()
+    local res = assert(proxy_client:send {
+      method = "TRACE",
+      path = "/",
+    })
+
+    assert.res_status(405, res)
+    local body = res:read_body()
+    assert.matches("kong/", res.headers.server, nil, true)
+    assert.not_matches("openresty/", body, nil, true)
   end)
 end)

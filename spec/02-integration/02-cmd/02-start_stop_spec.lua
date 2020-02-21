@@ -1,6 +1,10 @@
 local helpers = require "spec.helpers"
 
-describe("kong start/stop", function()
+
+
+for _, strategy in helpers.each_strategy() do
+
+describe("kong start/stop #" .. strategy, function()
   lazy_setup(function()
     helpers.get_db_utils(nil, {
       "routes",
@@ -53,6 +57,21 @@ describe("kong start/stop", function()
     assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path))
     assert.truthy(helpers.path.exists(helpers.test_conf.kong_env))
   end)
+
+  if strategy == "cassandra" then
+    it("start resolves cassandra contact points", function()
+      assert(helpers.kong_exec("start", {
+        prefix = helpers.test_conf.prefix,
+        database = strategy,
+        cassandra_contact_points = "localhost",
+        cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
+      }))
+      assert(helpers.kong_exec("stop", {
+        prefix = helpers.test_conf.prefix,
+      }))
+    end)
+  end
+
   it("creates prefix directory if it doesn't exist", function()
     finally(function()
       helpers.kill_all("foobar")
@@ -169,7 +188,7 @@ describe("kong start/stop", function()
     end)
   end)
 
-  describe("nginx_daemon = off", function()
+  describe("nginx_main_daemon = off", function()
     it("redirects nginx's stdout to 'kong start' stdout", function()
       local pl_utils = require "pl.utils"
       local pl_file = require "pl.file"
@@ -181,7 +200,7 @@ describe("kong start/stop", function()
       end)
 
       local cmd = string.format("KONG_PROXY_ACCESS_LOG=/dev/stdout "    ..
-                                "KONG_NGINX_DAEMON=off %s start -c %s " ..
+                                "KONG_NGINX_MAIN_DAEMON=off %s start -c %s " ..
                                 ">%s 2>/dev/null &", helpers.bin_path,
                                 helpers.test_conf_path, stdout_path)
 
@@ -190,23 +209,18 @@ describe("kong start/stop", function()
         error(stderr)
       end
 
-      do
-        local proxy_client
+      helpers.wait_until(function()
+        local cmd = string.format("%s health -p ./servroot", helpers.bin_path)
+        return pl_utils.executeex(cmd)
+      end, 10)
 
-        -- get a connection, retry until kong starts
-        helpers.wait_until(function()
-          local pok
-          pok, proxy_client = pcall(helpers.proxy_client)
-          return pok
-        end, 10)
+      local proxy_client = assert(helpers.proxy_client())
 
-        local res = assert(proxy_client:send {
-          method = "GET",
-          path = "/hello",
-        })
-        assert.res_status(404, res) -- no Route configured
-      end
-
+      local res = assert(proxy_client:send {
+        method = "GET",
+        path = "/hello",
+      })
+      assert.res_status(404, res) -- no Route configured
       assert(helpers.stop_kong(helpers.test_conf.prefix))
 
       -- TEST: since nginx started in the foreground, the 'kong start' command
@@ -215,6 +229,107 @@ describe("kong start/stop", function()
       assert.matches([["GET /hello HTTP/1.1" 404]] , stdout, nil, true)
     end)
   end)
+
+  describe("nginx_main_daemon = off #flaky on Travis", function()
+    it("redirects nginx's stdout to 'kong start' stdout", function()
+      local pl_utils = require "pl.utils"
+      local pl_file = require "pl.file"
+
+      local stdout_path = os.tmpname()
+
+      finally(function()
+        os.remove(stdout_path)
+      end)
+
+      local cmd = string.format("KONG_PROXY_ACCESS_LOG=/dev/stdout "    ..
+                                "KONG_NGINX_MAIN_DAEMON=off %s start -c %s " ..
+                                ">%s 2>/dev/null &", helpers.bin_path,
+                                helpers.test_conf_path, stdout_path)
+
+      local ok, _, _, stderr = pl_utils.executeex(cmd)
+      if not ok then
+        error(stderr)
+      end
+
+      helpers.wait_until(function()
+        local cmd = string.format("%s health -p ./servroot", helpers.bin_path)
+        return pl_utils.executeex(cmd)
+      end, 10)
+
+      local proxy_client = assert(helpers.proxy_client())
+
+      local res = assert(proxy_client:send {
+        method = "GET",
+        path = "/hello",
+      })
+      assert.res_status(404, res) -- no Route configured
+      assert(helpers.stop_kong(helpers.test_conf.prefix))
+
+      -- TEST: since nginx started in the foreground, the 'kong start' command
+      -- stdout should receive all of nginx's stdout as well.
+      local stdout = pl_file.read(stdout_path)
+      assert.matches([["GET /hello HTTP/1.1" 404]] , stdout, nil, true)
+    end)
+  end)
+
+  if strategy == "off" then
+    describe("declarative config start", function()
+      it("starts with a valid declarative config file", function()
+        local yaml_file = helpers.make_yaml_file [[
+          _format_version: "1.1"
+          services:
+          - name: my-service
+            url: http://127.0.0.1:15555
+            routes:
+            - name: example-route
+              hosts:
+              - example.test
+        ]]
+
+        local proxy_client
+
+        finally(function()
+          os.remove(yaml_file)
+          helpers.stop_kong(helpers.test_conf.prefix)
+          if proxy_client then
+            proxy_client:close()
+          end
+        end)
+
+        assert(helpers.start_kong({
+          database = "off",
+          declarative_config = yaml_file,
+          nginx_worker_processes = 100, -- stress test initialization
+          nginx_conf = "spec/fixtures/custom_nginx.template",
+        }))
+
+        helpers.wait_until(function()
+          -- get a connection, retry until kong starts
+          helpers.wait_until(function()
+            local pok
+            pok, proxy_client = pcall(helpers.proxy_client)
+            return pok
+          end, 10)
+
+          local res = assert(proxy_client:send {
+            method = "GET",
+            path = "/",
+            headers = {
+              host = "example.test",
+            }
+          })
+          local ok = res.status == 200
+
+          if proxy_client then
+            proxy_client:close()
+            proxy_client = nil
+          end
+
+          return ok
+        end, 10)
+      end)
+    end)
+  end
 
   describe("errors", function()
     it("start inexistent Kong conf file", function()
@@ -287,5 +402,174 @@ describe("kong start/stop", function()
           dict .. " [SIZE];' directive is defined.", err, nil, true)
       end
     end)
+    it("ensures lua-resty-core is loaded", function()
+        finally(function()
+          helpers.stop_kong()
+        end)
+
+        local ok, err = helpers.start_kong({
+          prefix = helpers.test_conf.prefix,
+          database = helpers.test_conf.database,
+          pg_database = helpers.test_conf.pg_database,
+          cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
+          nginx_http_lua_load_resty_core = "off",
+        })
+        assert.falsy(ok)
+        assert.matches(helpers.unindent([[
+          lua-resty-core must be loaded; make sure 'lua_load_resty_core'
+          is not disabled.
+        ]], nil, true), err, nil, true)
+    end)
+
+    if strategy == "cassandra" then
+      it("errors when cassandra contact points cannot be resolved", function()
+        local ok, stderr = helpers.start_kong({
+          database = strategy,
+          cassandra_contact_points = "invalid.inexistent.host",
+          cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
+        })
+
+        assert.False(ok)
+        assert.matches("could not resolve any of the provided Cassandra contact points " ..
+                       "(cassandra_contact_points = 'invalid.inexistent.host')", stderr, nil, true)
+
+        finally(function()
+          helpers.stop_kong()
+          helpers.kill_all()
+          pcall(helpers.dir.rmtree)
+        end)
+      end)
+    end
+
+    if strategy == "off" then
+      it("does not start with an invalid declarative config file", function()
+        local yaml_file = helpers.make_yaml_file [[
+          _format_version: "1.1"
+          services:
+          - name: "@gobo"
+            url: http://mockbin.org
+          - name: my-service
+            url: http://mockbin.org
+            routes:
+            - name: example-route
+              hosts:
+              - example.test
+              - \\99
+        ]]
+
+        finally(function()
+          os.remove(yaml_file)
+          helpers.stop_kong()
+        end)
+
+        local ok, err = helpers.start_kong({
+          database = "off",
+          declarative_config = yaml_file,
+        })
+        assert.falsy(ok)
+        assert.matches(helpers.unindent[[
+          in 'services':
+            - in entry 1 of 'services':
+              in 'name': invalid value '@gobo': it must only contain alphanumeric and '., -, _, ~' characters
+            - in entry 2 of 'services':
+              in 'routes':
+                - in entry 1 of 'routes':
+                  in 'hosts':
+                    - in entry 2 of 'hosts': invalid hostname: \\99
+        ]], err, nil, true)
+      end)
+    end
+
+  end)
+
+  describe("deprecated properties", function()
+    describe("prints a warning to stderr", function()
+      local u = helpers.unindent
+
+      it("'nginx_optimizations'", function()
+        local opts = {
+          prefix = helpers.test_conf.prefix,
+          database = helpers.test_conf.database,
+          pg_database = helpers.test_conf.pg_database,
+          cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
+          nginx_optimizations = true,
+        }
+
+        local _, stderr, stdout = assert(helpers.kong_exec("start", opts))
+        assert.matches("Kong started", stdout, nil, true)
+        assert.matches(u([[
+          [warn] the 'nginx_optimizations' configuration property is deprecated
+        ]], nil, true), stderr, nil, true)
+
+        local _, stderr, stdout = assert(helpers.kong_exec("stop", opts))
+        assert.matches("Kong stopped", stdout, nil, true)
+        assert.equal("", stderr)
+      end)
+
+      it("'upstream_keepalive'", function()
+        local opts = {
+          prefix = helpers.test_conf.prefix,
+          database = helpers.test_conf.database,
+          pg_database = helpers.test_conf.pg_database,
+          cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
+          upstream_keepalive = 0,
+        }
+
+        local _, stderr, stdout = assert(helpers.kong_exec("start", opts))
+        assert.matches("Kong started", stdout, nil, true)
+        assert.matches(u([[
+          [warn] the 'upstream_keepalive' configuration property is deprecated,
+          use 'nginx_upstream_keepalive' instead
+        ]], nil, true), stderr, nil, true)
+
+        local _, stderr, stdout = assert(helpers.kong_exec("stop", opts))
+        assert.matches("Kong stopped", stdout, nil, true)
+        assert.equal("", stderr)
+      end)
+
+      it("'nginx_http_upstream_keepalive_timeout'", function()
+        local opts = {
+          prefix = helpers.test_conf.prefix,
+          database = helpers.test_conf.database,
+          pg_database = helpers.test_conf.pg_database,
+          cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
+          nginx_http_upstream_keepalive_timeout = "30s",
+        }
+
+        local _, stderr, stdout = assert(helpers.kong_exec("start", opts))
+        assert.matches("Kong started", stdout, nil, true)
+        assert.matches(u([[
+          [warn] the 'nginx_http_upstream_keepalive_timeout' configuration property is deprecated,
+          use 'nginx_upstream_keepalive_timeout' instead
+        ]], nil, true), stderr, nil, true)
+
+        local _, stderr, stdout = assert(helpers.kong_exec("stop", opts))
+        assert.matches("Kong stopped", stdout, nil, true)
+        assert.equal("", stderr)
+      end)
+
+      it("'nginx_http_upstream_keepalive_requests'", function()
+        local opts = {
+          prefix = helpers.test_conf.prefix,
+          database = helpers.test_conf.database,
+          pg_database = helpers.test_conf.pg_database,
+          cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
+          nginx_http_upstream_keepalive_requests = 50,
+        }
+
+        local _, stderr, stdout = assert(helpers.kong_exec("start", opts))
+        assert.matches("Kong started", stdout, nil, true)
+        assert.matches(u([[
+          [warn] the 'nginx_http_upstream_keepalive_requests' configuration property is deprecated,
+          use 'nginx_upstream_keepalive_requests' instead
+        ]], nil, true), stderr, nil, true)
+
+        local _, stderr, stdout = assert(helpers.kong_exec("stop", opts))
+        assert.matches("Kong stopped", stdout, nil, true)
+        assert.equal("", stderr)
+      end)
+    end)
   end)
 end)
+
+end

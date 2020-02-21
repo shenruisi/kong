@@ -7,12 +7,13 @@ return {
   name = "ldap-auth",
   fields = {
     { consumer = typedefs.no_consumer },
-    { run_on = typedefs.run_on_first },
+    { protocols = typedefs.protocols_http },
     { config = {
         type = "record",
         fields = {
           { ldap_host = typedefs.host({ required = true }), },
           { ldap_port = typedefs.port({ required = true }), },
+          { ldaps = { required = true, type = "boolean", default = false } },
           { start_tls = { type = "boolean", required = true, default = false }, },
           { verify_ldap_host = { type = "boolean", required = true, default = false }, },
           { base_dn = { type = "string", required = true }, },
@@ -21,9 +22,16 @@ return {
           { hide_credentials = { type = "boolean", default = false }, },
           { timeout = { type = "number", default = 10000 }, },
           { keepalive = { type = "number", default = 60000 }, },
-          { anonymous = { type = "string", uuid = true, legacy = true }, },
+          { anonymous = { type = "string" }, },
           { header_type = { type = "string", default = "ldap" }, },
         },
+        entity_checks = {
+          { conditional = {
+            if_field   = "ldaps",     if_match   = { eq = true },
+            then_field = "start_tls", then_match = { eq = false },
+            then_err   = "'ldaps' and 'start_tls' cannot be enabled simultaneously"
+          } },
+        }
     }, },
   },
 }

@@ -37,9 +37,9 @@ for _, strategy in helpers.each_strategy() do
 
     describe("/consumers/:consumer/basic-auth/", function()
       lazy_setup(function()
-        consumer = bp.consumers:insert {
+        consumer = bp.consumers:insert({
           username = "bob"
-        }
+        }, { nulls = true })
       end)
       after_each(function()
         db:truncate("basicauth_credentials")
@@ -62,6 +62,25 @@ for _, strategy in helpers.each_strategy() do
           local json = cjson.decode(body)
           assert.equal(consumer.id, json.consumer.id)
           assert.equal("bob", json.username)
+        end)
+        it("creates a basic-auth credential with tags", function()
+          local res = assert(admin_client:send {
+            method  = "POST",
+            path    = "/consumers/bob/basic-auth/",
+            body    = {
+              username = "bobby",
+              password = "kong",
+              tags     = { "tag1", "tag2" },
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(201, res)
+          local json = cjson.decode(body)
+          assert.equal(consumer.id, json.consumer.id)
+          assert.equal("tag1", json.tags[1])
+          assert.equal("tag2", json.tags[2])
         end)
         it("hashes the password", function()
           local res = assert(admin_client:send {
@@ -117,7 +136,10 @@ for _, strategy in helpers.each_strategy() do
             })
             local body = assert.res_status(400, res)
             local json = cjson.decode(body)
-            assert.same({ username = "required field missing" }, json.fields)
+            assert.same({
+              username = "required field missing",
+              password = "required field missing",
+            }, json.fields)
           end)
           it("cannot create two identical usernames", function()
             local res = assert(admin_client:send {
@@ -255,7 +277,10 @@ for _, strategy in helpers.each_strategy() do
             })
             local body = assert.res_status(400, res)
             local json = cjson.decode(body)
-            assert.same({ username  = "expected a string" }, json.fields)
+            assert.same({
+              username  = "expected a string",
+              password = "required field missing",
+            }, json.fields)
           end)
         end)
       end)
@@ -278,6 +303,24 @@ for _, strategy in helpers.each_strategy() do
           local json = cjson.decode(body)
           assert.not_equal(previous_hash, json.password)
         end)
+        it("ignores a nil password when updated by id", function()
+          local previous_hash = credential.password
+
+          local res = assert(admin_client:send {
+            method  = "PATCH",
+            path    = "/consumers/bob/basic-auth/" .. credential.id,
+            body    = {
+              username = "Tyrion Lannister"
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(200, res)
+          local json = cjson.decode(body)
+          assert.equal("Tyrion Lannister", json.username)
+          assert.equal(previous_hash, json.password)
+        end)
         it("updates a credential by username", function()
           local previous_hash = credential.password
 
@@ -294,6 +337,24 @@ for _, strategy in helpers.each_strategy() do
           local body = assert.res_status(200, res)
           local json = cjson.decode(body)
           assert.not_equal(previous_hash, json.password)
+        end)
+        it("ignores a nil password when updated by username", function()
+          local previous_hash = credential.password
+
+          local res = assert(admin_client:send {
+            method  = "PATCH",
+            path    = "/consumers/bob/basic-auth/" .. credential.username,
+            body    = {
+              username = "Tyrion Lannister"
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(200, res)
+          local json = cjson.decode(body)
+          assert.equal("Tyrion Lannister", json.username)
+          assert.equal(previous_hash, json.password)
         end)
         describe("errors", function()
           it("handles invalid input", function()
@@ -347,14 +408,16 @@ for _, strategy in helpers.each_strategy() do
           db:truncate("basicauth_credentials")
           bp.basicauth_credentials:insert {
             consumer = { id = consumer.id },
-            username = "bob"
+            username = "bob",
+            password = "secret",
           }
           consumer2 = bp.consumers:insert {
             username = "bob-the-buidler"
           }
           bp.basicauth_credentials:insert {
             consumer = { id = consumer2.id },
-            username = "bob-the-buidler"
+            username = "bob-the-buidler",
+            password = "secret",
           }
         end)
         it("retrieves all the basic-auths with trailing slash", function()
@@ -407,7 +470,121 @@ for _, strategy in helpers.each_strategy() do
           --assert.is_nil(json_2.offset) -- last page
         end)
       end)
+
+      describe("POST", function()
+        lazy_setup(function()
+          db:truncate("basicauth_credentials")
+        end)
+
+        it("does not create basic-auth credential when missing consumer", function()
+          local res = assert(admin_client:send {
+            method = "POST",
+            path = "/basic-auths",
+            body = {
+              username = "bob",
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(400, res)
+          local json = cjson.decode(body)
+          assert.same("2 schema violations (consumer: required field missing; password: required field missing)", json.message)
+        end)
+
+        it("creates basic-auth credential", function()
+          local res = assert(admin_client:send {
+            method = "POST",
+            path = "/basic-auths",
+            body = {
+              username = "bob",
+              password = "test",
+              consumer = {
+                id = consumer.id
+              }
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(201, res)
+          local json = cjson.decode(body)
+          assert.equal("bob", json.username)
+        end)
+      end)
     end)
+
+    describe("/basic-auths/:username_or_id", function()
+      describe("PATCH", function()
+        local consumer2
+
+        lazy_setup(function()
+          consumer2 = bp.consumers:insert({
+            username = "john"
+          })
+        end)
+
+        it("does not allow updating consumer as it would invalidate the password", function()
+          local res = assert(admin_client:send {
+            method = "PATCH",
+            path = "/basic-auths/bob",
+            body = {
+              consumer = {
+                id = consumer2.id
+              }
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+
+          local body = assert.res_status(400, res)
+          local json = cjson.decode(body)
+          assert.same("schema violation (all or none of these fields must be set: 'password', 'consumer.id')", json.message)
+        end)
+      end)
+
+      describe("PUT", function()
+        lazy_setup(function()
+          db:truncate("basicauth_credentials")
+        end)
+
+        it("does not create basic-auth credential when missing consumer", function()
+          local res = assert(admin_client:send {
+            method = "PUT",
+            path = "/basic-auths/bob",
+            body = {
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(400, res)
+          local json = cjson.decode(body)
+          assert.same("2 schema violations (consumer: required field missing; password: required field missing)", json.message)
+        end)
+
+        it("creates basic-auth credential", function()
+          local res = assert(admin_client:send {
+            method = "PUT",
+            path = "/basic-auths/bob",
+            body = {
+              password = "secret",
+              consumer = {
+                id = consumer.id
+              }
+            },
+            headers = {
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(200, res)
+          local json = cjson.decode(body)
+          assert.equal("bob", json.username)
+        end)
+      end)
+    end)
+
     describe("/basic-auths/:credential_username_or_id/consumer", function()
       describe("GET", function()
         local credential
@@ -415,7 +592,8 @@ for _, strategy in helpers.each_strategy() do
           db:truncate("basicauth_credentials")
           credential = bp.basicauth_credentials:insert {
             consumer = { id = consumer.id },
-            username = "bob"
+            username = "bob",
+            password = "secret",
           }
         end)
         it("retrieve consumer from a basic-auth id", function()

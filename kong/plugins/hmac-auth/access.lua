@@ -1,6 +1,6 @@
 local constants = require "kong.constants"
 local sha256 = require "resty.sha256"
-local openssl_hmac = require "openssl.hmac"
+local openssl_hmac = require "resty.openssl.hmac"
 local utils = require "kong.tools.utils"
 
 
@@ -132,10 +132,11 @@ local function create_hash(request_uri, hmac_params)
     if not header_value then
       if header == "request-line" then
         -- request-line in hmac headers list
-        local request_line = fmt("%s %s HTTP/%s", kong.request.get_method(),
-                                 request_uri, kong.request.get_http_version())
+        local request_line = fmt("%s %s HTTP/%.01f",
+                                 kong.request.get_method(),
+                                 request_uri,
+                                 assert(kong.request.get_http_version()))
         signing_string = signing_string .. request_line
-
       else
         signing_string = signing_string .. header .. ":"
       end
@@ -234,18 +235,6 @@ local function validate_body()
 end
 
 
-local function load_consumer_into_memory(consumer_id, anonymous)
-  local result, err = kong.db.consumers:select { id = consumer_id }
-  if not result then
-    if anonymous and not err then
-      err = 'anonymous consumer "' .. consumer_id .. '" not found'
-    end
-    return nil, err
-  end
-  return result
-end
-
-
 local function set_consumer(consumer, credential)
   local set_header = kong.service.request.set_header
   local clear_header = kong.service.request.clear_header
@@ -299,7 +288,7 @@ local function do_authentication(conf)
   if not (validate_clock_skew(X_DATE, conf.clock_skew) or
           validate_clock_skew(DATE, conf.clock_skew)) then
     return false, {
-      status = 403,
+      status = 401,
       message = "HMAC signature cannot be verified, a valid date or " ..
                 "x-date header is required for HMAC Authentication"
     }
@@ -322,33 +311,33 @@ local function do_authentication(conf)
   local ok, err = validate_params(hmac_params, conf)
   if not ok then
     kong.log.debug(err)
-    return false, { status = 403, message = SIGNATURE_NOT_VALID }
+    return false, { status = 401, message = SIGNATURE_NOT_VALID }
   end
 
   -- validate signature
   local credential = load_credential(hmac_params.username)
   if not credential then
     kong.log.debug("failed to retrieve credential for ", hmac_params.username)
-    return false, { status = 403, message = SIGNATURE_NOT_VALID }
+    return false, { status = 401, message = SIGNATURE_NOT_VALID }
   end
 
   hmac_params.secret = credential.secret
 
   if not validate_signature(hmac_params) then
-    return false, { status = 403, message = SIGNATURE_NOT_SAME }
+    return false, { status = 401, message = SIGNATURE_NOT_SAME }
   end
 
   -- If request body validation is enabled, then verify digest.
   if conf.validate_request_body and not validate_body() then
     kong.log.debug("digest validation failed")
-    return false, { status = 403, message = SIGNATURE_NOT_SAME }
+    return false, { status = 401, message = SIGNATURE_NOT_SAME }
   end
 
   -- Retrieve consumer
   local consumer_cache_key, consumer
   consumer_cache_key = kong.db.consumers:cache_key(credential.consumer.id)
   consumer, err      = kong.cache:get(consumer_cache_key, nil,
-                                      load_consumer_into_memory,
+                                      kong.client.load_consumer,
                                       credential.consumer.id)
   if err then
     kong.log.err(err)
@@ -377,10 +366,10 @@ function _M.execute(conf)
       -- get anonymous user
       local consumer_cache_key = kong.db.consumers:cache_key(conf.anonymous)
       local consumer, err      = kong.cache:get(consumer_cache_key, nil,
-                                                load_consumer_into_memory,
+                                                kong.client.load_consumer,
                                                 conf.anonymous, true)
       if err then
-        kong.log.err(err)
+        kong.log.err("failed to load anonymous consumer:", err)
         return kong.response.exit(500, { message = "An unexpected error occurred" })
       end
 

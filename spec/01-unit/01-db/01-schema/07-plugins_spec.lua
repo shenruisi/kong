@@ -1,3 +1,4 @@
+require "spec.helpers" -- initializes 'kong' global for plugins
 local Entity = require "kong.db.schema.entity"
 local typedefs = require "kong.db.schema.typedefs"
 local utils = require "kong.tools.utils"
@@ -6,7 +7,7 @@ local services_definition = require "kong.db.schema.entities.services"
 local consumers_definition = require "kong.db.schema.entities.consumers"
 local plugins_definition = require "kong.db.schema.entities.plugins"
 local dao_plugins = require "kong.db.dao.plugins"
-
+local certificates_definition = require "kong.db.schema.entities.certificates"
 
 describe("plugins", function()
   local Plugins
@@ -14,8 +15,10 @@ describe("plugins", function()
 
   lazy_setup(function()
     assert(Entity.new(consumers_definition))
+    assert(Entity.new(certificates_definition))
     assert(Entity.new(services_definition))
     assert(Entity.new(routes_definition))
+
     Plugins = assert(Entity.new(plugins_definition))
 
     local my_plugins = {
@@ -136,17 +139,23 @@ describe("plugins", function()
         headers = {},
         json = {}
       },
+      rename = {
+        headers = {},
+      },
       replace = {
         headers = {},
-        json = {}
+        json = {},
+        json_types = {}
       },
       add = {
         headers = {},
-        json = {}
+        json = {},
+        json_types = {}
       },
       append = {
         headers = {},
-        json = {}
+        json = {},
+        json_types = {}
       }
     }, plugin.config)
   end)

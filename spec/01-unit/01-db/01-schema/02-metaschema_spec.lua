@@ -15,6 +15,71 @@ describe("metaschema", function()
     assert.falsy(MetaSchema:validate(s))
   end)
 
+  it("requires an array schema to have `elements`", function()
+    local s = {
+      name = "bad",
+      primary_key = { "f" },
+      fields = {
+        { f = { type = "array" } }
+      }
+    }
+    local ok, err = MetaSchema:validate(s)
+    assert.falsy(ok)
+    assert.match("field of type 'array' must declare 'elements'", err.f)
+  end)
+
+  it("requires an set schema to have `elements`", function()
+    local s = {
+      name = "bad",
+      primary_key = { "f" },
+      fields = {
+        { f = { type = "set" } }
+      }
+    }
+    local ok, err = MetaSchema:validate(s)
+    assert.falsy(ok)
+    assert.match("field of type 'set' must declare 'elements'", err.f)
+  end)
+
+  it("requires a map schema to have `keys`", function()
+    local s = {
+      name = "bad",
+      primary_key = { "f" },
+      fields = {
+        { f = { type = "map", values = { type = "string" } } }
+      }
+    }
+    local ok, err = MetaSchema:validate(s)
+    assert.falsy(ok)
+    assert.match("field of type 'map' must declare 'keys'", err.f)
+  end)
+
+  it("requires a map schema to have `values`", function()
+    local s = {
+      name = "bad",
+      primary_key = { "f" },
+      fields = {
+        { f = { type = "map", keys = { type = "string" } } }
+      }
+    }
+    local ok, err = MetaSchema:validate(s)
+    assert.falsy(ok)
+    assert.match("field of type 'map' must declare 'values'", err.f)
+  end)
+
+  it("requires a record schema to have `fields`", function()
+    local s = {
+      name = "bad",
+      primary_key = { "f" },
+      fields = {
+        { f = { type = "record" } }
+      }
+    }
+    local ok, err = MetaSchema:validate(s)
+    assert.falsy(ok)
+    assert.match("field of type 'record' must declare 'fields'", err.f)
+  end)
+
   it("fields cannot be empty", function()
     local s = {
       name = "bad",
@@ -360,7 +425,18 @@ describe("metaschema", function()
         { foo = { type = "any" } } } }
     local ok, err = MetaSchema:validate(s)
     assert.falsy(ok)
-    assert.match("expected one of", err.fields.type)
+    assert.match("expected one of", err.fields[1].type)
+  end)
+
+  it("accepts an 'err' field", function()
+    local s = {
+      name = "hello",
+      primary_key = { "foo" },
+      fields = {
+        { foo = { type = "array", elements = {type = "string"}, eq = ngx.null, err = "cannot set value" } }
+      }
+    }
+    assert.truthy(MetaSchema:validate(s))
   end)
 
   describe("subschemas", function()
@@ -501,6 +577,281 @@ describe("metaschema", function()
     -- does not account for cyclic schemas at this point.
     assert.truthy(MetaSchema:validate(MetaSchema))
   end)
+
+  it("validates transformation has transformation function specified (positive)", function()
+    assert.truthy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+
+    assert.truthy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          on_read = function() return true end,
+        },
+      },
+    }))
+
+    assert.truthy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          on_read = function() return true end,
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates transformation has transformation function specified (negative)", function()
+    assert.falsy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+        },
+      },
+    }))
+  end)
+
+  it("validates transformation input fields exists (positive)", function()
+    assert.truthy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates transformation input fields exists (negative)", function()
+    assert.falsy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "nonexisting" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates nested transformation input fields exists (positive)", function()
+    assert.truthy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" }
+              },
+            }
+          }
+        },
+      },
+      transformations = {
+        {
+          input = { "test.field" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates nested transformation input fields exists (negative)", function()
+    assert.falsy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" },
+              },
+            },
+          },
+        },
+      },
+      transformations = {
+        {
+          input = { "test.nonexisting" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+
+    assert.falsy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" },
+              },
+            },
+          },
+        },
+      },
+      transformations = {
+        {
+          input = { "nonexisting.field" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates transformation needs fields exists (positive)", function()
+    assert.truthy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          needs = { "test" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates transformation needs fields exists (negative)", function()
+    assert.falsy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          needs = { "nonexisting" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates nested transformation needs fields exists (positive)", function()
+    assert.truthy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" }
+              },
+            }
+          }
+        },
+      },
+      transformations = {
+        {
+          input = { "test.field" },
+          needs = { "test.field" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates nested transformation needs fields exists (negative)", function()
+    assert.falsy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" },
+              },
+            },
+          },
+        },
+      },
+      transformations = {
+        {
+          input = { "test.field" },
+          needs = { "test.nonexisting" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+
+    assert.falsy(MetaSchema:validate({
+      name = "test",
+      primary_key = { "test" },
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" },
+              },
+            },
+          },
+        },
+      },
+      transformations = {
+        {
+          input = { "test.field" },
+          needs = { "nonexisting.field" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
 end)
 
 
@@ -516,7 +867,9 @@ describe("metasubschema", function()
     local ok, err = MetaSchema.MetaSubSchema:validate(s)
     assert.falsy(ok)
     assert.same({
-      fields = "expected a record",
+      fields = {
+        "expected a record",
+      },
       foo = "'foo' must be a table",
       primary_key = "unknown field"
     }, err)
@@ -585,7 +938,7 @@ describe("metasubschema", function()
     local ok, err = MetaSchema.MetaSubSchema:validate(s)
     assert.falsy(ok)
     assert.match("only one of these fields must be non-empty",
-                 err.entity_checks["@entity"][1], 1, true)
+                 err.entity_checks[1]["@entity"][1], 1, true)
   end)
 
   it("accepts a function in an entity check", function()
@@ -627,8 +980,11 @@ describe("metasubschema", function()
     assert.falsy(ok)
     assert.same({
       fields = {
-        elements = { "unknown field",
-          type = "required field missing"
+        {
+          elements = {
+            "unknown field",
+            type = "required field missing",
+          }
         }
       },
       foo = "missing type declaration",
@@ -719,7 +1075,7 @@ describe("metasubschema", function()
         { foo = { type = "any" } } } }
     local ok, err = MetaSchema.MetaSubSchema:validate(s)
     assert.falsy(ok)
-    assert.match("expected one of", err.fields.type)
+    assert.match("expected one of", err.fields[1].type)
   end)
 
   it("validates a value with 'eq'", function()

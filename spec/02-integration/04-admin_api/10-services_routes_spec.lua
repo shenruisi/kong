@@ -331,6 +331,78 @@ for _, strategy in helpers.each_strategy() do
             end
           end)
 
+          it_content_types("updates with url", function(content_type)
+            return function()
+              if content_type == "multipart/form-data" then
+                -- the client doesn't play well with this
+                return
+              end
+
+              local service = bp.services:insert()
+
+              local res = client:patch("/services/" .. service.id, {
+                headers = {
+                  ["Content-Type"] = content_type
+                },
+                body = {
+                  url = "http://example.test:443"
+                },
+              })
+
+              local body = assert.res_status(200, res)
+              local json = cjson.decode(body)
+              assert.equal("http",         json.protocol)
+              assert.equal("example.test", json.host)
+              assert.equal(443,            json.port)
+              assert.equal(cjson.null,     json.path)
+              assert.equal(service.id,     json.id)
+
+              local in_db = assert(db.services:select({ id = service.id }, { nulls = true }))
+              assert.same(json, in_db)
+
+
+              local res = client:patch("/services/" .. service.id, {
+                headers = {
+                  ["Content-Type"] = content_type
+                },
+                body = {
+                  url = "https://example2.test:80/"
+                },
+              })
+
+              local body = assert.res_status(200, res)
+              local json = cjson.decode(body)
+              assert.equal("https",         json.protocol)
+              assert.equal("example2.test", json.host)
+              assert.equal(80,             json.port)
+              assert.equal("/",             json.path)
+              assert.equal(service.id,      json.id)
+
+              local in_db = assert(db.services:select({ id = service.id }, { nulls = true }))
+              assert.same(json, in_db)
+
+              local res = client:patch("/services/" .. service.id, {
+                headers = {
+                  ["Content-Type"] = content_type
+                },
+                body = {
+                  url = "http://example2.test"
+                },
+              })
+
+              local body = assert.res_status(200, res)
+              local json = cjson.decode(body)
+              assert.equal("http",          json.protocol)
+              assert.equal("example2.test", json.host)
+              assert.equal(80,              json.port)
+              assert.equal(cjson.null,      json.path)
+              assert.equal(service.id,      json.id)
+
+              local in_db = assert(db.services:select({ id = service.id }, { nulls = true }))
+              assert.same(json, in_db)
+            end
+          end)
+
         end)
 
         describe("DELETE", function()
@@ -523,9 +595,9 @@ for _, strategy in helpers.each_strategy() do
                       id = service.id,
                     }
                   },
-                  message = [[UNIQUE violation detected on '{]] ..
-                            [[service={id="]] .. service.id ..
-                            [["},name="basic-auth",route=null,consumer=null}']],
+                  message = [[UNIQUE violation detected on '{consumer=null,name="basic-auth",]] ..
+                            [[route=null,service={id="]] .. service.id ..
+                            [["}}']],
                 }, json)
               end
             end)
@@ -567,6 +639,10 @@ for _, strategy in helpers.each_strategy() do
         describe("PATCH", function()
           it("updates a plugin", function()
             local service = bp.services:insert()
+            bp.routes:insert({
+              service = { id = service.id },
+              hosts = { "example.test" },
+            })
             local plugin = bp.key_auth_plugins:insert({ service = service })
             local res = assert(client:send {
               method = "PATCH",
@@ -583,6 +659,10 @@ for _, strategy in helpers.each_strategy() do
           end)
           it("updates a plugin bis", function()
             local service = bp.services:insert()
+            bp.routes:insert({
+              service = { id = service.id },
+              hosts = { "example.test" },
+            })
             local plugin = bp.key_auth_plugins:insert({ service = service })
 
             plugin.enabled = not plugin.enabled
@@ -621,6 +701,10 @@ for _, strategy in helpers.each_strategy() do
           describe("errors", function()
             it("handles invalid input", function()
               local service = bp.services:insert()
+              bp.routes:insert({
+                service = { id = service.id },
+                hosts = { "example.test" },
+              })
               local plugin = bp.key_auth_plugins:insert({
                 service = service,
                 config = { key_names = { "testkey" } },
@@ -723,7 +807,7 @@ for _, strategy in helpers.each_strategy() do
               })
             body = assert.res_status(400, res)
             json = cjson.decode(body)
-            assert.same({ protocol = "expected one of: http, https, tcp, tls" }, json.fields)
+            assert.same({ protocol = "expected one of: grpc, grpcs, http, https, tcp, tls" }, json.fields)
           end
         end)
 

@@ -1,70 +1,60 @@
-local endpoints = require "kong.api.endpoints"
+local endpoints   = require "kong.api.endpoints"
+local utils       = require "kong.tools.utils"
 
 
-local kong             = kong
-local acls_schema      = kong.db.acls.schema
-local consumers_schema = kong.db.consumers.schema
+local ngx = ngx
+local kong = kong
+local escape_uri = ngx.escape_uri
+local unescape_uri = ngx.unescape_uri
 
 
 return {
-  ["/consumers/:consumers/acls/"] = {
-    schema = acls_schema,
-    methods = {
-      GET = endpoints.get_collection_endpoint(
-              acls_schema, consumers_schema, "consumer"),
-      POST = endpoints.post_collection_endpoint(
-              acls_schema, consumers_schema, "consumer"),
-    },
-  },
-
   ["/consumers/:consumers/acls/:acls"] = {
-    schema = acls_schema,
-    methods = {
-      before = function(self, db, helpers)
-        local consumer, _, err_t = endpoints.select_entity(self, db, consumers_schema)
-        if err_t then
-          return endpoints.handle_error(err_t)
-        end
-        if not consumer then
-          return kong.response.exit(404, { message = "Not found" })
-        end
+    schema = kong.db.acls.schema,
+    before = function(self, db, helpers)
+      local group = unescape_uri(self.params.acls)
+      if not utils.is_valid_uuid(group) then
+        local consumer_id = unescape_uri(self.params.consumers)
 
-        self.consumer = consumer
-
-        if self.req.method ~= "PUT" then
-          local acl, _, err_t = endpoints.select_entity(self, db, acls_schema)
+        if not utils.is_valid_uuid(consumer_id) then
+          local consumer, _, err_t = endpoints.select_entity(self, db, db.consumers.schema)
           if err_t then
             return endpoints.handle_error(err_t)
           end
 
-          if not acl or acl.consumer.id ~= consumer.id then
+          if not consumer then
             return kong.response.exit(404, { message = "Not found" })
           end
 
-          self.acl = acl
-          self.params.acls = acl.id
+          consumer_id = consumer.id
         end
-      end,
-      GET  = endpoints.get_entity_endpoint(acls_schema),
-      PUT  = function(self, db, helpers)
-        self.args.post.consumer = { id = self.consumer.id }
-        return endpoints.put_entity_endpoint(acls_schema)(self, db, helpers)
-      end,
-      PATCH  = endpoints.patch_entity_endpoint(acls_schema),
-      DELETE = endpoints.delete_entity_endpoint(acls_schema),
-    },
-  },
-  ["/acls"] = {
-    schema = acls_schema,
-    methods = {
-      GET = endpoints.get_collection_endpoint(acls_schema),
-    }
-  },
-  ["/acls/:acls/consumer"] = {
-    schema = consumers_schema,
-    methods = {
-      GET = endpoints.get_entity_endpoint(
-              acls_schema, consumers_schema, "consumer"),
-    }
+
+        local cache_key = db.acls:cache_key(consumer_id, group)
+        local acl, _, err_t = db.acls:select_by_cache_key(cache_key)
+        if err_t then
+          return endpoints.handle_error(err_t)
+        end
+
+        if acl then
+          self.params.acls = escape_uri(acl.id)
+        else
+          if self.req.method ~= "PUT" then
+            return kong.response.exit(404, { message = "Not found" })
+          end
+
+          self.params.acls = utils.uuid()
+        end
+
+        self.params.group = group
+      end
+    end,
+
+    PUT = function(self, db, helpers, parent)
+      if not self.args.post.group and self.params.group then
+        self.args.post.group = self.params.group
+      end
+
+      return parent()
+    end
   }
 }

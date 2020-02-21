@@ -148,6 +148,14 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         consumer      = { id = consumer.id },
       }
 
+      admin_api.oauth2_credentials:insert {
+        client_id     = "clientid10112",
+        client_secret = "secret10112",
+        redirect_uris = ngx.null,
+        name          = "testapp311",
+        consumer      = { id = consumer.id },
+      }
+
       local service1    = admin_api.services:insert()
       local service2    = admin_api.services:insert()
       local service2bis = admin_api.services:insert()
@@ -161,6 +169,7 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
       local service10   = admin_api.services:insert()
       local service11   = admin_api.services:insert()
       local service12   = admin_api.services:insert()
+      local service13   = admin_api.services:insert()
 
       local route1 = assert(admin_api.routes:insert({
         hosts     = { "oauth2.com" },
@@ -238,6 +247,12 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         hosts       = { "oauth2_12.com" },
         protocols   = { "http", "https" },
         service     = service12,
+      }))
+
+      local route13 = assert(admin_api.routes:insert({
+        hosts       = { "oauth2_13.com" },
+        protocols   = { "http", "https" },
+        service     = service13,
       }))
 
       admin_api.oauth2_plugins:insert({
@@ -334,6 +349,14 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           global_credentials = true,
           auth_header_name   = "custom_header_name",
           hide_credentials   = true,
+        },
+      })
+
+      admin_api.oauth2_plugins:insert({
+        route = { id = route13.id },
+        config   = {
+          scopes    = { "email", "profile", "user.email" },
+          anonymous = anonymous_user.username,
         },
       })
 
@@ -921,7 +944,27 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           local json = cjson.decode(body)
           assert.same({ error_description = "Invalid client authentication", error = "invalid_client" }, json)
         end)
-        it("returns an error when client_secret is not sent", function()
+        it("returns an error when empty client_id and empty client_secret is sent", function()
+          local res = assert(proxy_ssl_client:send {
+            method  = "POST",
+            path    = "/oauth2/token",
+            body    = {
+              client_id        = "",
+              client_secret    = "",
+              scope            = "email",
+              response_type    = "token",
+              grant_type       = "client_credentials",
+            },
+            headers = {
+              ["Host"]         = "oauth2_4.com",
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(400, res)
+          local json = cjson.decode(body)
+          assert.same({ error_description = "Invalid client authentication", error = "invalid_client" }, json)
+        end)
+        it("returns an error when grant_type is not sent", function()
           local res = assert(proxy_ssl_client:send {
             method  = "POST",
             path    = "/oauth2/token",
@@ -1057,25 +1100,23 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           local body = assert.res_status(200, res)
           assert.is_table(ngx.re.match(body, [[^\{"token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
         end)
-        it("fails with an application that has multiple redirect_uri, and by passing an invalid redirect_uri", function()
+        it("returns success with an application that has not redirect_uri", function()
           local res = assert(proxy_ssl_client:send {
             method  = "POST",
             path    = "/oauth2/token",
             body    = {
-              client_id        = "clientid456",
-              client_secret    = "secret456",
+              client_id        = "clientid10112",
+              client_secret    = "secret10112",
               scope            = "email",
               grant_type       = "client_credentials",
-              redirect_uri     = "http://two.com/two/hello"
             },
             headers = {
               ["Host"]         = "oauth2_4.com",
               ["Content-Type"] = "application/json"
             }
           })
-          local body = assert.res_status(400, res)
-          local json = cjson.decode(body)
-          assert.same({ error = "invalid_request", error_description = "Invalid redirect_uri that does not match with any redirect_uri created with the application" }, json)
+          local body = assert.res_status(200, res)
+          assert.is_table(ngx.re.match(body, [[^\{"token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
         end)
         it("returns success with authenticated_userid and valid provision_key", function()
           local res = assert(proxy_ssl_client:send {
@@ -1746,6 +1787,17 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         })
         assert.res_status(200, res)
       end)
+      it("fails when missing access_token is being sent in the custom header", function()
+        local res = assert(proxy_ssl_client:send {
+          method = "GET",
+          path = "/request",
+          headers = {
+            ["Host"] = "oauth2_11.com",
+            ["custom_header_name"] = "",
+          }
+        })
+        assert.res_status(401, res)
+      end)
       it("fails when a correct access_token is being sent in the wrong header", function()
         local token = provision_token("oauth2_11.com",nil,"clientid1011","secret1011")
 
@@ -1916,6 +1968,18 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           path    = "/request",
           headers = {
             ["Host"] = "oauth2_7.com"
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.are.equal("true", body.headers["x-anonymous-consumer"])
+        assert.equal('no-body', body.headers["x-consumer-username"])
+      end)
+      it("works with wrong credentials and username in anonymous", function()
+        local res = assert(proxy_ssl_client:send {
+          method  = "POST",
+          path    = "/request",
+          headers = {
+            ["Host"] = "oauth2_13.com"
           }
         })
         local body = cjson.decode(assert.res_status(200, res))
@@ -2607,7 +2671,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           enable_authorization_code = true,
           mandatory_scope = false,
           provision_key = "provision123",
-          anonymous = "",
           global_credentials = false,
           refresh_token_ttl = 2
         }
@@ -2626,7 +2689,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           enable_authorization_code = true,
           mandatory_scope = false,
           provision_key = "provision123",
-          anonymous = "",
           global_credentials = false,
           refresh_token_ttl = 0
         }

@@ -35,13 +35,17 @@ end
 
 local admin_api_as_db = {}
 
-for name, _ in pairs(helpers.db.daos) do
+for name, dao in pairs(helpers.db.daos) do
+  local admin_api_name = dao.schema.admin_api_name or name
   admin_api_as_db[name] = {
     insert = function(_, tbl)
-      return api_send("POST", "/" .. name, tbl)
+      return api_send("POST", "/" .. admin_api_name, tbl)
     end,
     remove = function(_, tbl)
-      return api_send("DELETE", "/" .. name .. "/" .. tbl.id)
+      return api_send("DELETE", "/" .. admin_api_name .. "/" .. tbl.id)
+    end,
+    update = function(_, id, tbl)
+      return api_send("PATCH", "/" .. admin_api_name .. "/" .. id, tbl)
     end,
   }
 end
@@ -53,6 +57,21 @@ admin_api_as_db["basicauth_credentials"] = {
   end,
   remove = function(_, tbl)
     return api_send("DELETE", "/consumers/" .. tbl.consumer.id .. "/basic-auth/" .. tbl.id)
+  end,
+  update = function(_, id, tbl)
+    return api_send("PATCH", "/consumers/" .. tbl.consumer.id .. "/basic-auth/" .. id, tbl)
+  end,
+}
+
+admin_api_as_db["targets"] = {
+  insert = function(_, tbl)
+    return api_send("POST", "/upstreams/" .. tbl.upstream.id .. "/targets", tbl)
+  end,
+  remove = function(_, tbl)
+    return api_send("DELETE", "/upstreams/" .. tbl.upstream.id .. "/targets/" .. tbl.id)
+  end,
+  update = function(_, id, tbl)
+    return api_send("PATCH", "/upstreams/" .. tbl.upstream.id .. "/targets/" .. id, tbl)
   end,
 }
 

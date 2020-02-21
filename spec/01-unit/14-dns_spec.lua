@@ -12,7 +12,7 @@ describe("DNS", function()
     stub(ngx, "log")
     singletons = require "kong.singletons"
 
-    singletons.cache = {
+    singletons.core_cache = {
       get = function() return {} end
     }
 
@@ -23,8 +23,6 @@ describe("DNS", function()
     }
     --]]
 
-    singletons.origins = {}
-
     balancer = require "kong.runloop.balancer"
     balancer.init()
 
@@ -34,7 +32,7 @@ describe("DNS", function()
 
   lazy_teardown(function()
     if type(ngx.log) == "table" then
-      ngx.log:revert()
+      ngx.log:revert() -- luacheck: ignore
     end
   end)
 

@@ -26,7 +26,7 @@ end
 return {
   name = "response-ratelimiting",
   fields = {
-    { run_on = typedefs.run_on { one_of = { "first", "second" } } },
+    { protocols = typedefs.protocols_http },
     { config = {
         type = "record",
         fields = {

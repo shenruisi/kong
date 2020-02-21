@@ -1,6 +1,3 @@
-require("resty.core")
-
-
 local ran_before
 
 
@@ -14,9 +11,17 @@ return function(options)
   ran_before = true
 
 
-
   options = options or {}
   local meta = require "kong.meta"
+
+
+  if options.cli then
+    -- disable the _G write guard alert log introduced in OpenResty 1.15.8.1
+    -- when in CLI or when running tests in resty-cli
+    --local _G_mt = getmetatable(_G)
+    setmetatable(_G, nil)
+  end
+
 
   _G._KONG = {
     _NAME = meta._NAME,
@@ -64,14 +69,20 @@ return function(options)
       -- See https://github.com/openresty/resty-cli/pull/12
       -- for a definitive solution of using shms in CLI
       local SharedDict = {}
-      local function set(data, key, value)
+      local function set(data, key, value, expire_at)
         data[key] = {
           value = value,
-          info = {expired = false}
+          info = {expire_at = expire_at}
         }
       end
       function SharedDict:new()
         return setmetatable({data = {}}, {__index = self})
+      end
+      function SharedDict:capacity()
+        return 0
+      end
+      function SharedDict:free_space()
+        return 0
       end
       function SharedDict:get(key)
         return self.data[key] and self.data[key].value, nil
@@ -87,13 +98,16 @@ return function(options)
           return false, "exists", false
         end
 
+        local expire_at = nil
+
         if exptime then
           ngx.timer.at(exptime, function()
             self.data[key] = nil
           end)
+          expire_at = ngx.now() + exptime
         end
 
-        set(self.data, key, value)
+        set(self.data, key, value, expire_at)
         return true, nil, false
       end
       SharedDict.safe_add = SharedDict.add
@@ -110,12 +124,18 @@ return function(options)
         end
         return true
       end
-      function SharedDict:incr(key, value, init)
+      function SharedDict:incr(key, value, init, init_ttl)
         if not self.data[key] then
           if not init then
             return nil, "not found"
           else
-            self.data[key] = { value = init }
+            self.data[key] = { value = init, info = {} }
+            if init_ttl then
+              self.data[key].info.expire_at = ngx.now() + init_ttl
+              ngx.timer.at(init_ttl, function()
+                self.data[key] = nil
+              end)
+            end
           end
         elseif type(self.data[key].value) ~= "number" then
           return nil, "not a number"
@@ -125,7 +145,7 @@ return function(options)
       end
       function SharedDict:flush_all()
         for _, item in pairs(self.data) do
-          item.info.expired = true
+          item.info.expire_at = ngx.now()
         end
       end
       function SharedDict:flush_expired(n)
@@ -133,7 +153,7 @@ return function(options)
         local flushed = 0
 
         for key, item in pairs(self.data) do
-          if item.info.expired then
+          if item.info.expire_at and item.info.expire_at <= ngx.now() then
             data[key] = nil
             flushed = flushed + 1
             if n and flushed == n then
@@ -156,6 +176,24 @@ return function(options)
           end
         end
         return keys
+      end
+      function SharedDict:ttl(key)
+        local item = self.data[key]
+        if item == nil then
+          return nil, "not found"
+        else
+          local expire_at = item.info.expire_at
+          if expire_at == nil then
+            return 0
+          else
+            local remaining = expire_at - ngx.now()
+            if remaining < 0 then
+              return nil, "not found"
+            else
+              return remaining
+            end
+          end
+        end
       end
 
       -- hack
@@ -280,9 +318,11 @@ return function(options)
 
     local function resolve_connect(f, sock, host, port, opts)
       if sub(host, 1, 5) ~= "unix:" then
-        host, port = toip(host, port)
+        local try_list
+        host, port, try_list = toip(host, port)
         if not host then
-          return nil, "[toip() name lookup failed]: " .. tostring(port)
+          return nil, "[cosocket] DNS resolution failed: " .. tostring(port) ..
+                      ". Tried: " .. tostring(try_list)
         end
       end
 
